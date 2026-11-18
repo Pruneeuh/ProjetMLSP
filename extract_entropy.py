@@ -1,4 +1,4 @@
-"""Étape 2 : prétraitement, fenêtrage, DWT (5 bandes) et calcul des 5 entropies.
+"""Étape 2 : prétraitement, fenêtrage, DWT (5 bandes) et calcul des 4 entropies.
 
 Entrée  : outputs/<name>_signals.npz + <name>_metadata.csv  (produits par load_eeg.py)
 Sortie  : outputs/<name>_entropy_features.csv
@@ -104,7 +104,7 @@ def fuzzy_entropy(x, m=2, r=0.2, nexp=2):
         return np.nan
     
     try:
-        FuzzyEn,_,_ = EH.FuzzEn(x, m=m, r=(r*sd,nexp))
+        FuzzyEn,_,_ = EH.FuzzEn((x-x.mean()) / sd, m=m, r=(r,nexp))
     except Exception:
         return np.nan
     return _last(FuzzyEn)
@@ -119,13 +119,13 @@ def dispersion_entropy(x, m=2, c=6, delay=1):
     return _last(DispEn)
     
 
-def shannon_entropy(x, bins=32):
-    """Entropie de Shannon de l'histogramme des amplitudes"""
+def shannon_entropy(x, bins=8):
+    """Entropie de Shannon de l'histogramme des amplitudes, normalisée """
     try : 
         h, _ = np.histogram(x, bins=bins)
         p = h / h.sum()
         p = p[p > 0]
-        return -np.sum(p*np.log2(p))
+        return -np.sum(p*np.log2(p)) / np.log2(bins)
     except Exception:
         return np.nan
 
@@ -169,9 +169,7 @@ def run_dataset(name, win_sec, overlap, wavelet, workers):
 
     all_rows = []
     with ProcessPoolExecutor(max_workers=workers) as ex:
-        '''for i, rows in enumerate(ex.map(process_subject, tasks), 1):
-            all_rows.extend(rows)
-            print(f"  {i}/{len(tasks)} {tasks[i - 1][0]}: {len(rows)} fenêtres")'''
+        
         for i, rows in enumerate(ex.map(process_subject, tasks), 1):
             all_rows.extend(rows)
             print(f"[{name}] {i}/{len(tasks)} sujets traités")

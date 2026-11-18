@@ -16,6 +16,7 @@ import mne
 import numpy as np
 import pandas as pd
 import scipy.io
+import hashlib
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 DATA_ROOT = SCRIPT_DIR / "data_eeg"
@@ -26,6 +27,18 @@ MUMTAZ_CHANNELS = ["Fp1", "Fp2", "F7", "F3", "Fz", "F4", "F8", "T3", "C3", "Cz",
                    "C4", "T4", "T5", "P3", "Pz", "P4", "T6", "O1", "O2"]
 
 Dataset = Tuple[List[np.ndarray], np.ndarray, List[str]]
+
+def drop_duplicates(signals, labels, ids):
+    """Retire les enregistrements dont le signal est identique à un précédent."""
+    seen, keep = {}, []
+    for i, s in enumerate(signals):
+        h = hashlib.sha1(np.ascontiguousarray(s).tobytes()).hexdigest()
+        if h in seen:
+            print(f"  ! Doublon : {ids[i]} identique à {ids[seen[h]]}, ignoré")
+        else:
+            seen[h] = i
+            keep.append(i)
+    return ([signals[i] for i in keep], np.asarray(labels)[keep], [ids[i] for i in keep])
 
 
 def load_mumtaz(path: Path, condition: str = MUMTAZ_CONDITION) -> Dataset:
@@ -147,5 +160,6 @@ if __name__ == "__main__":
     for i, (name, fn, p) in enumerate(jobs, 1):
         print(f"[{i}/3] {name}")
         sig, lab, ids = fn(p)
+        sig, lab, ids = drop_duplicates(sig, lab, ids) 
         summarize(name, sig, lab)
         save_dataset(name, sig, lab, ids)
