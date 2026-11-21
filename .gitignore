@@ -1,1 +1,6 @@
 outputs/mumtaz_signals.npz
+outputs/entropy_features.csv
+outputs/participant_entropy_features.csv
+outputs/classification_metrics.csv
+outputs/classification_predictions.csv
+__pycache__/
