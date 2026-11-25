@@ -3,4 +3,8 @@ outputs/entropy_features.csv
 outputs/participant_entropy_features.csv
 outputs/classification_metrics.csv
 outputs/classification_predictions.csv
+outputs/*_entropy_features.csv
+outputs/window_*.csv
 __pycache__/
+outputs/*_extra_features.csv
+outputs/extra_features.log
