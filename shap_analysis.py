@@ -10,11 +10,12 @@ import numpy as np
 import pandas as pd
 from joblib import parallel_backend
 from sklearn.base import clone
+from sklearn.exceptions import FitFailedWarning
 from sklearn.model_selection import RandomizedSearchCV, StratifiedGroupKFold
 from sklearn.utils.class_weight import compute_sample_weight
 
 # model_tuning imports LightGBM first: importing shap before LightGBM crashes LightGBM's training on Windows
-from model_tuning import PROFILES, TREE_MODELS, positive_score  # noqa: I001
+from model_tuning import PROFILES, TREE_MODELS, positive_score, search_n_jobs, uses_gpu  # noqa: I001
 import shap
 
 LINEAR_MODELS = {'logistic_regression', 'lda'}
@@ -35,10 +36,15 @@ def fit_final_model(table, feature_columns, model_name, models, profile='compreh
         clone(pipeline), space,
         n_iter=cfg['n_iter_trees'] if model_name in TREE_MODELS else cfg['n_iter'],
         cv=StratifiedGroupKFold(n_splits=cfg['inner_folds'], shuffle=True, random_state=seed),
-        scoring='roc_auc', n_jobs=n_jobs, random_state=seed, error_score=np.nan)
+        scoring='roc_auc', n_jobs=search_n_jobs(model_name, pipeline, n_jobs), random_state=seed,
+        error_score='raise' if uses_gpu(model_name, pipeline) else np.nan)
     fit_params = {'model__sample_weight': compute_sample_weight('balanced', y)} if model_name == 'xgboost' else {}
     with warnings.catch_warnings():
         warnings.simplefilter('ignore')
+        warnings.filterwarnings('always', category=FitFailedWarning)
+        warnings.filterwarnings('always', message='Scoring failed.*')
+        if model_name == 'xgboost' and pipeline.get_params()['model__device'] == 'cuda':
+            warnings.filterwarnings('always', message='.*(No visible GPU|not compiled with CUDA support).*')
         with parallel_backend('threading'):
             search.fit(X, y, groups=groups, **fit_params)
     return search.best_estimator_, search.best_score_, search.best_params_

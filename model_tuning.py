@@ -4,6 +4,7 @@ Splits are always made on participants (``groups``). Imputation, scaling, featur
 hyperparameter search are all fitted on the outer training participants only, so the outer test
 participants never influence any choice. Used for both window-level and participant-level tables.
 """
+import json
 import time
 import warnings
 
@@ -11,10 +12,12 @@ import numpy as np
 import pandas as pd
 from joblib import parallel_backend
 from lightgbm import LGBMClassifier
+from lightgbm.basic import LightGBMError
 from scipy.stats import loguniform, randint, uniform
 from sklearn.base import clone
 from sklearn.discriminant_analysis import LinearDiscriminantAnalysis
 from sklearn.ensemble import RandomForestClassifier
+from sklearn.exceptions import FitFailedWarning
 from sklearn.feature_selection import SelectPercentile, f_classif
 from sklearn.impute import SimpleImputer
 from sklearn.linear_model import LogisticRegression
@@ -27,6 +30,7 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.svm import SVC
 from sklearn.utils.class_weight import compute_sample_weight
 from xgboost import XGBClassifier
+from xgboost.core import XGBoostError
 
 # n_iter: candidates sampled per model and outer fold (n_iter_trees for the slower tree ensembles);
 # repeats: number of different outer splits
@@ -39,6 +43,58 @@ TREE_MODELS = {'random_forest', 'xgboost', 'lightgbm'}
 SELECT_PERCENTILE = [10, 25, 50, 100]
 
 
+def xgboost_device():
+    """Test actual CUDA training; XGBoost can silently switch an unavailable GPU to CPU."""
+    probe = XGBClassifier(n_estimators=1, max_depth=1, tree_method='hist', device='cuda', n_jobs=1)
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter('always')
+        try:
+            probe.fit(np.array([[0.0], [1.0], [2.0], [3.0]]), np.array([0, 0, 1, 1]))
+        except XGBoostError as exc:
+            print(f'XGBoost GPU probe failed; using CPU: {exc}', flush=True)
+            return 'cpu'
+    device = json.loads(probe.get_booster().save_config())['learner']['generic_param'].get('device')
+    if device is None:
+        print('XGBoost does not report its device; using CPU. GPU training requires XGBoost 2.0+.', flush=True)
+        return 'cpu'
+    if not device.startswith('cuda'):
+        details = '; '.join(str(w.message) for w in caught)
+        print(f'XGBoost GPU unavailable; using CPU. {details}', flush=True)
+        return 'cpu'
+    print(f'XGBoost GPU available: {device}', flush=True)
+    return 'cuda'
+
+
+def lightgbm_device():
+    """Test LightGBM's CUDA and OpenCL implementations independently of XGBoost."""
+    X = np.arange(80, dtype=float).reshape(-1, 1)
+    y = np.tile([0, 1], 40)
+    for device in ('cuda', 'gpu'):
+        try:
+            LGBMClassifier(n_estimators=1, min_child_samples=1, device_type=device,
+                           n_jobs=1, verbose=-1).fit(X, y)
+        except LightGBMError as exc:
+            print(f'LightGBM {device} unavailable: {exc}', flush=True)
+        else:
+            print(f'LightGBM GPU available: {device}', flush=True)
+            return device
+    print('LightGBM GPU unavailable; using CPU.', flush=True)
+    return 'cpu'
+
+
+def uses_gpu(name, pipeline):
+    params = pipeline.get_params()
+    return ((name == 'xgboost' and params['model__device'] == 'cuda')
+            or (name == 'lightgbm' and params['model__device_type'] in ('cuda', 'gpu')))
+
+
+def search_n_jobs(name, pipeline, n_jobs):
+    """Avoid concurrent GPU fits competing for the same device."""
+    if uses_gpu(name, pipeline):
+        return 1
+    return n_jobs
+
+
 def make_pipeline(model, scale=True):
     steps = [('imputer', SimpleImputer(strategy='median'))]
     if scale:
@@ -47,7 +103,7 @@ def make_pipeline(model, scale=True):
     return Pipeline(steps + [('model', model)])
 
 
-def build_models(seed=42):
+def build_models(seed=42, xgb_device='cpu', lgbm_device='cpu'):
     """name -> (pipeline, search space). Every space also tunes how many features are kept."""
     select = {'select__percentile': SELECT_PERCENTILE}
     return {
@@ -71,17 +127,17 @@ def build_models(seed=42):
             make_pipeline(RandomForestClassifier(random_state=seed, n_jobs=1), scale=False),
             {**select, 'model__n_estimators': randint(100, 300),
              'model__max_depth': [3, 5, 8, 12, None], 'model__min_samples_leaf': randint(1, 31),
-             'model__max_features': ['sqrt', 'log2', 0.05, 0.1],
-             'model__class_weight': ['balanced', 'balanced_subsample']}),
+             'model__max_features': ['sqrt', 'log2', 0.05, 0.1]}),
         'xgboost': (
-            make_pipeline(XGBClassifier(eval_metric='logloss', random_state=seed, n_jobs=1), scale=False),
+            make_pipeline(XGBClassifier(eval_metric='logloss', random_state=seed, n_jobs=1,
+                                        tree_method='hist', device=xgb_device), scale=False),
             {**select, 'model__n_estimators': randint(50, 400), 'model__learning_rate': loguniform(0.01, 0.3),
              'model__max_depth': randint(2, 7), 'model__min_child_weight': randint(1, 10),
              'model__subsample': uniform(0.5, 0.5), 'model__colsample_bytree': uniform(0.2, 0.8),
              'model__reg_lambda': loguniform(0.1, 30), 'model__gamma': uniform(0, 2)}),
         'lightgbm': (
             make_pipeline(LGBMClassifier(class_weight='balanced', subsample_freq=1, random_state=seed,
-                                         n_jobs=1, verbose=-1), scale=False),
+                                         n_jobs=1, verbose=-1, device_type=lgbm_device), scale=False),
             {**select, 'model__n_estimators': randint(50, 400), 'model__learning_rate': loguniform(0.01, 0.3),
              'model__num_leaves': randint(3, 32), 'model__min_child_samples': randint(5, 60),
              'model__subsample': uniform(0.5, 0.5), 'model__colsample_bytree': uniform(0.2, 0.8),
@@ -123,10 +179,15 @@ def nested_cv(X, y, groups, models, profile, seed=42, n_jobs=8, label=''):
                     clone(pipeline), space,
                     n_iter=cfg['n_iter_trees'] if name in TREE_MODELS else cfg['n_iter'],
                     cv=inner, scoring='roc_auc',
-                    n_jobs=n_jobs, random_state=seed + repeat, error_score=np.nan)
+                    n_jobs=search_n_jobs(name, pipeline, n_jobs), random_state=seed + repeat,
+                    error_score='raise' if uses_gpu(name, pipeline) else np.nan)
                 fit_params = {'model__sample_weight': weights} if name == 'xgboost' else {}
                 with warnings.catch_warnings():
                     warnings.simplefilter('ignore')
+                    warnings.filterwarnings('always', category=FitFailedWarning)
+                    warnings.filterwarnings('always', message='Scoring failed.*')
+                    if name == 'xgboost' and pipeline.get_params()['model__device'] == 'cuda':
+                        warnings.filterwarnings('always', message='.*(No visible GPU|not compiled with CUDA support).*')
                     # threads: LightGBM crashes on the read-only arrays that process workers receive
                     with parallel_backend('threading'):
                         search.fit(X.iloc[train_idx], y[train_idx], groups=groups[train_idx], **fit_params)
