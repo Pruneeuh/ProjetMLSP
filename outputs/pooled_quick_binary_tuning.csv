@@ -1,0 +1,6 @@
+task,model,repeat,fold,inner_balanced_accuracy,best_params
+binary,logistic_regression,1,1,0.7357953157953158,{'model__estimator__C': 0.1}
+binary,logistic_regression,1,2,0.7692812126145459,{'model__estimator__C': 0.01}
+binary,logistic_regression,1,3,0.7059112385199341,{'model__estimator__C': 0.1}
+binary,logistic_regression,1,4,0.7107758371526488,{'model__estimator__C': 0.01}
+binary,logistic_regression,1,5,0.7011864946647556,{'model__estimator__C': 0.1}

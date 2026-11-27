@@ -11,11 +11,11 @@ import pandas as pd
 from joblib import parallel_backend
 from sklearn.base import clone
 from sklearn.exceptions import FitFailedWarning
-from sklearn.model_selection import RandomizedSearchCV, StratifiedGroupKFold
-from sklearn.utils.class_weight import compute_sample_weight
+from sklearn.model_selection import RandomizedSearchCV
 
 # model_tuning imports LightGBM first: importing shap before LightGBM crashes LightGBM's training on Windows
-from model_tuning import PROFILES, TREE_MODELS, positive_score, search_n_jobs, uses_gpu  # noqa: I001
+from model_tuning import (PROFILES, TREE_MODELS, grouped_splits, positive_score,
+                          search_n_jobs, search_space_for_splits, uses_gpu, validation_groups)  # noqa: I001
 import shap
 
 LINEAR_MODELS = {'logistic_regression', 'lda'}
@@ -27,18 +27,21 @@ def _arrays(table, feature_columns):
     return X, table.label.astype(int).to_numpy(), table.subject_id.to_numpy()
 
 
-def fit_final_model(table, feature_columns, model_name, models, profile='comprehensive', seed=42, n_jobs=8):
+def fit_final_model(table, feature_columns, model_name, models, profile='comprehensive', seed=42, n_jobs=8,
+                    dataset=None):
     """Grouped randomized search on all participants; returns the refitted pipeline and its inner AUC."""
     cfg = PROFILES[profile] if isinstance(profile, str) else profile
     X, y, groups = _arrays(table, feature_columns)
+    if dataset is not None:
+        groups = validation_groups(dataset, groups)
     pipeline, space = models[model_name]
+    splits = grouped_splits(X, y, groups, cfg['inner_folds'], seed)
     search = RandomizedSearchCV(
-        clone(pipeline), space,
+        clone(pipeline), search_space_for_splits(model_name, space, splits),
         n_iter=cfg['n_iter_trees'] if model_name in TREE_MODELS else cfg['n_iter'],
-        cv=StratifiedGroupKFold(n_splits=cfg['inner_folds'], shuffle=True, random_state=seed),
+        cv=splits,
         scoring='roc_auc', n_jobs=search_n_jobs(model_name, pipeline, n_jobs), random_state=seed,
         error_score='raise' if uses_gpu(model_name, pipeline) else np.nan)
-    fit_params = {'model__sample_weight': compute_sample_weight('balanced', y)} if model_name == 'xgboost' else {}
     with warnings.catch_warnings():
         warnings.simplefilter('ignore')
         warnings.filterwarnings('always', category=FitFailedWarning)
@@ -46,7 +49,7 @@ def fit_final_model(table, feature_columns, model_name, models, profile='compreh
         if model_name == 'xgboost' and pipeline.get_params()['model__device'] == 'cuda':
             warnings.filterwarnings('always', message='.*(No visible GPU|not compiled with CUDA support).*')
         with parallel_backend('threading'):
-            search.fit(X, y, groups=groups, **fit_params)
+            search.fit(X, y, groups=groups)
     return search.best_estimator_, search.best_score_, search.best_params_
 
 

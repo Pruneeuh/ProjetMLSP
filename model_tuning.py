@@ -32,6 +32,8 @@ from sklearn.utils.class_weight import compute_sample_weight
 from xgboost import XGBClassifier
 from xgboost.core import XGBoostError
 
+from eeg_config import GROUPES_PRUDENTS
+
 # n_iter: candidates sampled per model and outer fold (n_iter_trees for the slower tree ensembles);
 # repeats: number of different outer splits
 PROFILES = {
@@ -41,6 +43,72 @@ PROFILES = {
 TREE_MODELS = {'random_forest', 'xgboost', 'lightgbm'}
 
 SELECT_PERCENTILE = [10, 25, 50, 100]
+
+
+class BalancedXGBClassifier(XGBClassifier):
+    """Compute balanced weights from the labels of each individual fit."""
+
+    def fit(self, X, y, *, sample_weight=None, **kwargs):
+        if sample_weight is None:
+            sample_weight = compute_sample_weight('balanced', y)
+        return super().fit(X, y, sample_weight=sample_weight, **kwargs)
+
+
+def validation_groups(dataset, subjects):
+    """Keep potentially related recordings together, without merging their predictions."""
+    subjects = pd.Series(subjects, dtype=str)
+    if dataset == 'borisov':
+        prudent = GROUPES_PRUDENTS['schizophrenie']
+        groups = {
+            f'SZ_{recording}': f'__validation_group__{group}'
+            for recording, group in prudent.items()
+        }
+        return subjects.replace(groups).to_numpy()
+    return subjects.to_numpy()
+
+
+def permute_group_labels(y, groups, rng):
+    """Permute labels between validation groups, keeping all their windows together."""
+    frame = pd.DataFrame({'group': np.asarray(groups), 'label': np.asarray(y)})
+    if (frame.groupby('group')['label'].nunique() != 1).any():
+        raise ValueError('A validation group contains conflicting labels.')
+    labels = frame.groupby('group', sort=False)['label'].first()
+    shuffled = pd.Series(rng.permutation(labels.to_numpy()), index=labels.index)
+    return frame['group'].map(shuffled).to_numpy()
+
+
+def grouped_splits(X, y, groups, n_splits, seed):
+    """Materialize and validate participant-disjoint, binary stratified folds."""
+    y = np.asarray(y)
+    groups = np.asarray(groups)
+    labels = pd.DataFrame({'group': groups, 'label': y}).groupby('group')['label'].nunique()
+    if (labels != 1).any():
+        raise ValueError('A validation group contains conflicting labels.')
+    cv = StratifiedGroupKFold(n_splits=n_splits, shuffle=True, random_state=seed)
+    splits = list(cv.split(X, y, groups))
+    for train, test in splits:
+        if np.intersect1d(groups[train], groups[test]).size:
+            raise ValueError('A validation group occurs in both training and test folds.')
+        if len(np.unique(y[train])) != 2 or len(np.unique(y[test])) != 2:
+            raise ValueError('Each training and validation fold must contain both classes.')
+    return splits
+
+
+def search_space_for_splits(name, space, splits):
+    """Restrict kNN candidates to the smallest actual inner-training fold."""
+    if name != 'knn':
+        return space
+    space = space.copy()
+    candidates = space['model__n_neighbors']
+    if hasattr(candidates, 'dist') and candidates.dist.name == 'randint':
+        low, high = candidates.support()
+        candidates = range(int(low), int(high) + 1)
+    max_neighbors = min(len(train) for train, _ in splits)
+    candidates = [int(k) for k in candidates if 1 <= k <= max_neighbors]
+    if not candidates:
+        raise ValueError(f'No kNN candidates fit the smallest inner-training fold ({max_neighbors} rows).')
+    space['model__n_neighbors'] = candidates
+    return space
 
 
 def xgboost_device():
@@ -129,8 +197,8 @@ def build_models(seed=42, xgb_device='cpu', lgbm_device='cpu'):
              'model__max_depth': [3, 5, 8, 12, None], 'model__min_samples_leaf': randint(1, 31),
              'model__max_features': ['sqrt', 'log2', 0.05, 0.1]}),
         'xgboost': (
-            make_pipeline(XGBClassifier(eval_metric='logloss', random_state=seed, n_jobs=1,
-                                        tree_method='hist', device=xgb_device), scale=False),
+            make_pipeline(BalancedXGBClassifier(eval_metric='logloss', random_state=seed, n_jobs=1,
+                                                tree_method='hist', device=xgb_device), scale=False),
             {**select, 'model__n_estimators': randint(50, 400), 'model__learning_rate': loguniform(0.01, 0.3),
              'model__max_depth': randint(2, 7), 'model__min_child_weight': randint(1, 10),
              'model__subsample': uniform(0.5, 0.5), 'model__colsample_bytree': uniform(0.2, 0.8),
@@ -153,13 +221,14 @@ def positive_score(model, X):
 
 
 def bootstrap_ci(y_true, y_pred, n_boot=1000, seed=0):
-    """95% interval of the balanced accuracy, resampling participants."""
+    """95% interval of mean repeat balanced accuracy, resampling participants."""
     rng = np.random.default_rng(seed)
+    y_pred = np.atleast_2d(y_pred)
     scores = []
     for _ in range(n_boot):
         idx = rng.integers(0, len(y_true), len(y_true))
         if len(np.unique(y_true[idx])) == 2:
-            scores.append(balanced_accuracy_score(y_true[idx], y_pred[idx]))
+            scores.append(np.mean([balanced_accuracy_score(y_true[idx], pred[idx]) for pred in y_pred]))
     return np.percentile(scores, [2.5, 97.5])
 
 
@@ -169,19 +238,18 @@ def nested_cv(X, y, groups, models, profile, seed=42, n_jobs=8, label=''):
     oof = {name: np.full((cfg['repeats'], len(y)), np.nan) for name in models}
     tuning_rows = []
     for repeat in range(cfg['repeats']):
-        outer = StratifiedGroupKFold(n_splits=cfg['outer_folds'], shuffle=True, random_state=seed + repeat)
-        inner = StratifiedGroupKFold(n_splits=cfg['inner_folds'], shuffle=True, random_state=seed + repeat)
-        for fold, (train_idx, test_idx) in enumerate(outer.split(X, y, groups)):
-            weights = compute_sample_weight('balanced', y[train_idx])
+        outer = grouped_splits(X, y, groups, cfg['outer_folds'], seed + repeat)
+        for fold, (train_idx, test_idx) in enumerate(outer):
+            inner = grouped_splits(X.iloc[train_idx], y[train_idx], groups[train_idx],
+                                   cfg['inner_folds'], seed + repeat)
             for name, (pipeline, space) in models.items():
                 start = time.time()
                 search = RandomizedSearchCV(
-                    clone(pipeline), space,
+                    clone(pipeline), search_space_for_splits(name, space, inner),
                     n_iter=cfg['n_iter_trees'] if name in TREE_MODELS else cfg['n_iter'],
                     cv=inner, scoring='roc_auc',
                     n_jobs=search_n_jobs(name, pipeline, n_jobs), random_state=seed + repeat,
                     error_score='raise' if uses_gpu(name, pipeline) else np.nan)
-                fit_params = {'model__sample_weight': weights} if name == 'xgboost' else {}
                 with warnings.catch_warnings():
                     warnings.simplefilter('ignore')
                     warnings.filterwarnings('always', category=FitFailedWarning)
@@ -190,7 +258,7 @@ def nested_cv(X, y, groups, models, profile, seed=42, n_jobs=8, label=''):
                         warnings.filterwarnings('always', message='.*(No visible GPU|not compiled with CUDA support).*')
                     # threads: LightGBM crashes on the read-only arrays that process workers receive
                     with parallel_backend('threading'):
-                        search.fit(X.iloc[train_idx], y[train_idx], groups=groups[train_idx], **fit_params)
+                        search.fit(X.iloc[train_idx], y[train_idx], groups=groups[train_idx])
                     oof[name][repeat, test_idx] = positive_score(search.best_estimator_, X.iloc[test_idx])
                 tuning_rows.append({'repeat': repeat, 'fold': fold, 'model': name,
                                     'inner_roc_auc': search.best_score_, 'best_params': search.best_params_})
@@ -205,35 +273,38 @@ def evaluate_dataset(table, feature_columns, task_name, dataset, profile='compre
     table = table.reset_index(drop=True)
     X = table[feature_columns].replace([np.inf, -np.inf], np.nan)
     y = table.label.astype(int).to_numpy()
-    groups = table.subject_id.to_numpy()
+    groups = validation_groups(dataset, table.subject_id)
     models = models or build_models(seed)
     oof, tuning = nested_cv(X, y, groups, models, profile, seed=seed, n_jobs=n_jobs, label=dataset)
     tuning.insert(0, 'dataset', dataset)
     rows, evaluation, prediction_frames = [], {}, []
     for name, probs in oof.items():
         per_repeat = []
+        repeat_predictions = []
         for prob in probs:
-            frame = pd.DataFrame({'subject_id': groups, 'label': y, 'probability': prob})
+            frame = pd.DataFrame({'subject_id': table.subject_id, 'label': y, 'probability': prob})
             part = frame.groupby('subject_id').agg(label=('label', 'first'), probability=('probability', 'mean'))
             pred = (part.probability.to_numpy() >= 0.5).astype(int)
             per_repeat.append((balanced_accuracy_score(part.label, pred),
-                               roc_auc_score(part.label, part.probability)))
-        frame = pd.DataFrame({'subject_id': groups, 'label': y, 'probability': probs.mean(axis=0)})
+                               roc_auc_score(part.label, part.probability),
+                               precision_score(part.label, pred, zero_division=0),
+                               recall_score(part.label, pred, zero_division=0),
+                               f1_score(part.label, pred, zero_division=0)))
+            repeat_predictions.append(pred)
+        frame = pd.DataFrame({'subject_id': table.subject_id, 'label': y, 'probability': probs.mean(axis=0)})
         participants = frame.groupby('subject_id').agg(
             label=('label', 'first'), probability=('probability', 'mean')).reset_index()
         y_true = participants.label.to_numpy()
         y_prob = participants.probability.to_numpy()
         y_pred = (y_prob >= 0.5).astype(int)
-        low, high = bootstrap_ci(y_true, y_pred)
-        ba, auc = np.array(per_repeat).T
+        low, high = bootstrap_ci(y_true, repeat_predictions)
+        ba, auc, precision, recall, f1 = np.array(per_repeat).T
         rows.append({'dataset': dataset, 'task': task_name, 'model': name,
             'n_participants': len(y_true), 'n_samples': len(y), 'n_features': len(feature_columns),
             'balanced_accuracy': ba.mean(), 'ba_sd_over_repeats': ba.std(), 'ba_ci_low': low, 'ba_ci_high': high,
-            'precision': precision_score(y_true, y_pred, zero_division=0),
-            'recall': recall_score(y_true, y_pred, zero_division=0),
-            'f1': f1_score(y_true, y_pred, zero_division=0),
-            'roc_auc': auc.mean(),
-            'sample_roc_auc': roc_auc_score(y, probs.mean(axis=0))})
+            'precision': precision.mean(), 'recall': recall.mean(), 'f1': f1.mean(),
+            'roc_auc': auc.mean(), 'auc_sd_over_repeats': auc.std(),
+            'sample_roc_auc': np.mean([roc_auc_score(y, prob) for prob in probs])})
         evaluation[name] = (y_true, y_pred, y_prob)
         prediction_frames.append(participants.assign(dataset=dataset, model=name, prediction=y_pred))
     return pd.DataFrame(rows), evaluation, pd.concat(prediction_frames), tuning

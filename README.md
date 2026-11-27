@@ -63,3 +63,29 @@ python 06_classification_multiclasse.py        # lit la fusion la plus récente
   témoins d'entraînement ; les fichiers `harmonise_*.csv` de 04 sont descriptifs.
 - Mac / conda : 07 importe PyTorch avant numpy, limite OpenMP à 1 fil et teste chaque réseau
   dans un sous-processus (voir l'en-tête du script).
+
+## Notebook `entropy_classification.ipynb`
+
+Le notebook utilise une analyse distincte de celle des scripts numérotés. La validation imbriquée
+garde les fenêtres d'un participant dans le même pli et regroupe par prudence les enregistrements
+Borisov `387-02w1` et `387-03w1` ; leur appartenance à une même personne n'est pas confirmée.
+Les contrôles recherchent les fenêtres de caractéristiques identiques et, si les signaux sont
+disponibles, les copies exactes d'enregistrements ou de segments bruts alignés de 10 secondes.
+Ils ne détectent pas toutes les copies transformées, les identités erronées ni les biais de site.
+
+Le notebook compare les caractéristiques d'entropie/complexité seules à ces mêmes caractéristiques
+avec les puissances, sur les mêmes partitions groupées. Il effectue trois répétitions par défaut :
+ces deux recherches complètes peuvent prendre plusieurs heures. Les nouveaux fichiers
+`outputs/window_repeated_*` sont distincts des anciens résultats, qui doivent être recalculés.
+Le contrôle de permutation est facultatif et coûteux ; l'analyse SHAP de stabilité réentraîne deux
+modèles supplémentaires par base. Aucun de ces contrôles ne remplace une validation externe sur
+des participants indépendants.
+
+La dernière section du notebook fusionne les fenêtres sur les dix électrodes supposées communes et
+évalue séparément deux classes (témoin / trouble), quatre classes (témoin / dépression /
+schizophrénie / anxiété) et la prédiction de la base chez les témoins. Les plis imbriqués sont
+stratifiés par base et statut, au niveau des groupes de validation, puis les probabilités des
+fenêtres sont moyennées par participant. Les poids d'apprentissage compensent le nombre de fenêtres
+par participant et sont équilibrés par classe dans chaque ajustement. Les résultats `pooled_*.csv`
+sont exploratoires : chaque trouble provenant d'une seule base, une bonne classification à quatre
+classes peut refléter les différences de site plutôt que les diagnostics.

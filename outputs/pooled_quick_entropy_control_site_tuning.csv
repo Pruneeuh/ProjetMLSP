@@ -1,0 +1,6 @@
+task,model,repeat,fold,inner_balanced_accuracy,best_params
+control_site,logistic_regression,1,1,0.9563492063492064,{'model__estimator__C': 0.1}
+control_site,logistic_regression,1,2,0.9682539682539683,{'model__estimator__C': 0.1}
+control_site,logistic_regression,1,3,0.9523809523809524,{'model__estimator__C': 0.1}
+control_site,logistic_regression,1,4,1.0,{'model__estimator__C': 0.1}
+control_site,logistic_regression,1,5,0.9861111111111112,{'model__estimator__C': 0.1}

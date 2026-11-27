@@ -1,0 +1,2 @@
+task,model,repeat,n_participants,n_windows,balanced_accuracy,macro_f1,roc_auc,recall_control,recall_disease,control_recall_mumtaz,control_recall_borisov,control_recall_sakib
+binary,logistic_regression,1,178,3308,0.7714140257095583,0.7724076205088863,0.8205421916762123,0.7283950617283951,0.8144329896907216,0.8148148148148148,0.7692307692307693,0.4666666666666667
