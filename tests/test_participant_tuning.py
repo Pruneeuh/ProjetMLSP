@@ -118,7 +118,34 @@ class ParticipantTuningTests(unittest.TestCase):
                 self.assertEqual(set(values["classe"]), set(interpretation.CLASSES))
                 self.assertTrue(np.isfinite(values.shap_abs_moyen).all())
 
-    def test_multiclass_and_interpretation_use_nested_fold_models(self):
+    def test_window_shap_weights_participants_equally(self):
+        y = np.arange(48) % 2
+        model, _ = eeg_tuning.tune_and_fit(
+            "regression_logistique", self.x[:40], y[:40], self.groups[:40], y[:40], 42, DEVICES,
+            enabled=False)
+        model.fit(self.x[:40], y[:40])
+        args = SimpleNamespace(shap_fond=4, shap_sujets=2, shap_echantillons=30)
+        columns = [f"F7|A4|measure{i}" for i in range(self.x.shape[1])]
+        subjects = np.array(["short", "long", "long", "long"])
+        values = np.vstack([np.zeros((1, len(columns))), np.full((3, len(columns)), 2.0)])
+        with patch("shap.LinearExplainer") as explainer:
+            explainer.return_value.shap_values.return_value = values
+            result = interpretation.expliquer_shap(
+                model, "regression_logistique", self.x[:40], self.x[40:44], columns, 2, args, 42,
+                self.groups[:40], subjects)
+        np.testing.assert_allclose(result.shap_abs_moyen, 1.0)
+
+    def test_permutation_preserves_each_participant_trajectory(self):
+        values = np.array([[10.0, 100], [20, 200], [21, 201], [22, 202]])
+        subjects = np.array(["short", "long", "long", "long"])
+        class Swap:
+            def permutation(self, ids):
+                return ids[::-1]
+        result = interpretation.permuter_sujets(values, subjects, np.array([0]), Swap())
+        np.testing.assert_array_equal(result[:, 0], [20, 10, 10, 10])
+        np.testing.assert_array_equal(result[:, 1], values[:, 1])
+
+    def test_multiclass_uses_nested_fold_models(self):
         rng = np.random.default_rng(42)
         bases = np.repeat(["depression", "schizophrenie", "anxiete"], 32)
         binary = np.tile(np.repeat([0, 1], 16), 3)
@@ -139,16 +166,6 @@ class ParticipantTuningTests(unittest.TestCase):
         self.assertEqual(len(metrics), 1)
         self.assertEqual(len(predictions), len(y))
         self.assertEqual(len(tuning), 3)
-        columns = [f"F7|alpha|measure{i}" for i in range(x.shape[1])]
-        strata = multiclass.strates(meta)
-        collected = dict(imp=[], coef=[], shap=[], tuning=[])
-        data = (pd.DataFrame(x, columns=columns), y, groups, bases, strata, "zscore", list(range(4)))
-        with patch.object(interpretation, "donnees_tache", return_value=data):
-            interpretation.analyser("multiclasse", args, {}, collected)
-        self.assertEqual(len(collected["tuning"]), 3)
-        self.assertEqual(len(collected["shap"]), 1)
-        self.assertEqual([row["best_params"] for row in tuning],
-                         [row["best_params"] for row in collected["tuning"]])
 
     def test_binary_nested_cv_and_multiclass_controls(self):
         rng = np.random.default_rng(7)
@@ -171,18 +188,6 @@ class ParticipantTuningTests(unittest.TestCase):
         self.assertEqual(probabilities.shape, (32, 2))
         self.assertEqual(len(choices), 3)
         self.assertTrue((fold_ids > 0).all())
-        args.modele = "knn"
-        args.tirages = 1
-        args.shap = False
-        columns = [f"F7|A4|measure{i}" for i in range(x.shape[1])]
-        collected = dict(imp=[], coef=[], shap=[], tuning=[])
-        data = (pd.DataFrame(x[:32], columns=columns), y_binary[:32], groups[:32],
-                None, y_binary[:32], "aucune", [0, 1])
-        with patch.object(interpretation, "donnees_tache", return_value=data):
-            interpretation.analyser("binaire_depression", args, {}, collected)
-        self.assertEqual([row["best_params"] for row in choices],
-                         [row["best_params"] for row in collected["tuning"]])
-
         inputs = {"entropies": x, "amplitude": x}
         site = multiclass.site_controls(inputs, meta, args, ["regression_logistique"])
         self.assertEqual(len(site), 8)

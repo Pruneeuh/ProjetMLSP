@@ -168,8 +168,8 @@ def main():
             p.exit(1, f"Colonnes SHAP manquantes : {sorted(needed - set(shap.columns))}\n")
         shap.sort_values("shap_abs_moyen", ascending=False).groupby(
             ["tache", "classe"], sort=False).head(10).to_csv(out / "shap_principales.csv", index=False)
-        notes.append(f"SHAP de 09 : modèles distincts sur données agrégées par sujet, pas les modèles "
-                     f"sur fenêtres de 05/06 ; peut inclure leurs sujets test (source : {interpretation}).")
+        notes.append(f"SHAP de 09 : vérifier interpretabilite.json pour la provenance et la portée ; "
+                     f"les anciennes sorties peuvent concerner d'autres modèles (source : {interpretation}).")
     else:
         log("  SHAP absent : lancer 09 avec --shap.")
     rows, comps, figures, classes_rows = [], [], [], []

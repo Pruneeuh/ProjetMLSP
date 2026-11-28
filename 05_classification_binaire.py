@@ -5,6 +5,7 @@ Sortie  : sorties/05_binaire/<date>/
     metriques_par_repetition.csv, resume.csv, predictions_test.csv
     ablation.csv               (--ablation) régression logistique sur une seule mesure / une seule bande
     permutations.csv           (--permutations N) test de permutation au niveau des sujets
+    modeles/ et modeles.json   modèles principaux ajustés et provenance pour l'étape 09
     roc_<base>.png, confusion_<base>.png
     parametres.json
 
@@ -49,7 +50,10 @@ import pandas as pd
 from sklearn.metrics import confusion_matrix
 
 from eeg_config import BASES, CLASSES_BINAIRES, GRAINE, NOM_TROUBLE
+from eeg_donnees import dossier_fusion_defaut
 from eeg_fenetres import charger_fenetres, moyenner_sujets, plis_groupes
+from eeg_modeles_sauvegardes import ecrire_manifeste, empreintes_fusion, sauvegarder_modele
+from eeg_reprise import Reprise
 from eeg_utils import (Compteur, arguments_dict, ecrire_json, entete, fmt_table, log,
                        multiclass_scores, nouveau_dossier, p_valeur_permutation,
                        plot_confusion, plot_roc, require, scores_binaires, summarise, versions,
@@ -60,7 +64,7 @@ MODELES = ["reference_majoritaire", "regression_logistique", "mlp", "svm", "svm_
 DEFAUT = [m for m in MODELES if m != "svm_rbf"]
 
 
-def cv_proba(nom, x, y, groups, folds, seed, args):
+def cv_proba(nom, x, y, groups, folds, seed, args, modeles=None):
     proba = np.zeros((len(y), 2))
     fold_id = np.zeros(len(y), dtype=int)
     choix = []
@@ -71,6 +75,8 @@ def cv_proba(nom, x, y, groups, folds, seed, args):
                                    fixed_c=args.c, fixed_mlp_layers=args.mlp_couches,
                                    fixed_mlp_alpha=args.mlp_alpha)
         est.fit(x[tr], y[tr])
+        if modeles is not None:
+            modeles.append(est)
         if result["best_params"]:
             choix.append(result)
         proba[te] = predict_proba(est, x[te], 2)
@@ -114,7 +120,19 @@ def analyser_base(base, args, collect):
         kind = "regression_logistique" if nom.startswith("reference_") and nom != "reference_majoritaire" else nom
         for rep, folds in enumerate(folds_by_rep):
             seed = args.graine + rep
-            proba, _, choix = cv_proba(kind, x, y, groups, folds, seed, args)
+            checkpoint = collect["reprise"]
+            cle = ["principal", task, nom, feat, rep + 1]
+            saved = checkpoint.charger(cle)
+            if saved is None:
+                modeles = [] if feat == "entropies" and nom != "reference_majoritaire" else None
+                proba, _, choix = cv_proba(kind, x, y, groups, folds, seed, args, modeles)
+                record = (sauvegarder_modele(collect["out"], task, nom, "aucune", rep + 1, modeles[0])
+                          if modeles is not None else None)
+                saved = (proba, choix, record)
+                checkpoint.enregistrer(cle, saved, [record["fichier"]] if record else [])
+            proba, choix, record = saved
+            if record is not None:
+                collect["modeles"].append(record)
             participants, p = moyenner_sujets(meta.iloc[test], y[test], proba[test])
             yt = participants["classe"].to_numpy()
             row, pred = multiclass_scores(yt, p, [0, 1])
@@ -145,6 +163,11 @@ def analyser_base(base, args, collect):
         groupes_var.update({f"bande={b}": cols.str.contains(f"|{b}|", regex=False) for b in bandes})
         groupes_var.update({f"sans_mesure={m}": ~cols.str.endswith("|" + m) for m in mesures})
         for nom_g, mask in groupes_var.items():
+            cle = ["ablation", base, nom_g]
+            saved = collect["reprise"].charger(cle)
+            if saved is not None:
+                collect["ablation"].append(saved)
+                continue
             x = ent.loc[:, mask.to_numpy()].to_numpy(float)[train]
             vals = []
             for rep, folds in enumerate(folds_train):
@@ -152,16 +175,23 @@ def analyser_base(base, args, collect):
                 participants, p = moyenner_sujets(meta.iloc[train], y[train], proba)
                 vals.append(multiclass_scores(participants["classe"], p, [0, 1])[0])
             v = pd.DataFrame(vals)
-            collect["ablation"].append(dict(base=base, sous_ensemble=nom_g, n_variables=x.shape[1],
-                                            exactitude_equilibree=v.exactitude_equilibree.mean(),
-                                            exactitude_equilibree_std=v.exactitude_equilibree.std(ddof=1) if len(v) > 1 else 0,
-                                            auc=v.auc.mean()))
+            result = dict(base=base, sous_ensemble=nom_g, n_variables=x.shape[1],
+                          exactitude_equilibree=v.exactitude_equilibree.mean(),
+                          exactitude_equilibree_std=v.exactitude_equilibree.std(ddof=1) if len(v) > 1 else 0,
+                          auc=v.auc.mean())
+            collect["reprise"].enregistrer(cle, result)
+            collect["ablation"].append(result)
             log(f"    {nom_g:<26s} {v.exactitude_equilibree.mean():.3f} (AUC {v.auc.mean():.3f})")
 
     if args.permutations:
         g = pd.Series(y[train], index=groups[train]).groupby(level=0).first()
         for nom in args.permutation_modeles:
             if nom not in args.modeles:
+                continue
+            cle = ["permutation", base, nom]
+            saved = collect["reprise"].charger(cle)
+            if saved is not None:
+                collect["perms"].append(saved)
                 continue
             rng = np.random.default_rng(args.graine)
             t0 = time.time()
@@ -193,9 +223,11 @@ def analyser_base(base, args, collect):
             obs = np.mean(observed)
             null = np.array(null)
             require(len(null) > 0, f"{base} : aucune permutation valide pour {nom}.")
-            collect["perms"].append(dict(base=base, modele=nom, observe=obs, moyenne_nulle=null.mean(),
-                                         quantile_95_nul=np.quantile(null, 0.95), p_valeur=p_valeur_permutation(obs, null),
-                                         n_permutations=len(null)))
+            result = dict(base=base, modele=nom, observe=obs, moyenne_nulle=null.mean(),
+                          quantile_95_nul=np.quantile(null, 0.95), p_valeur=p_valeur_permutation(obs, null),
+                          n_permutations=len(null))
+            collect["reprise"].enregistrer(cle, result)
+            collect["perms"].append(result)
             log(f"  permutations {nom} : nul {null.mean():.3f} (q95 {np.quantile(null, 0.95):.3f}), observé {obs:.3f}, "
                 f"p = {collect['perms'][-1]['p_valeur']:.3f} ({time.time() - t0:.0f} s)")
     collect["infos"][base] = dict(dossier=str(dossier), canaux=canaux, sujets=int(meta.subject_id.nunique()),
@@ -229,6 +261,7 @@ def main():
     calcul.add_argument("--cpu", action="store_true", help="Désactiver les sondes GPU et utiliser le CPU.")
     calcul.add_argument("--rapids", action="store_true", help="Essayer RAPIDS pour les modèles compatibles.")
     p.add_argument("--ablation", action="store_true", help="Contribution de chaque mesure et de chaque bande.")
+    p.add_argument("--reprendre", action="store_true", help="Réutiliser les calculs terminés compatibles.")
     p.add_argument("--permutations", type=int, default=0)
     p.add_argument("--permutation-modeles", nargs="+", choices=MODELES, default=["regression_logistique"])
     args = p.parse_args()
@@ -243,19 +276,25 @@ def main():
     if "xgboost" in args.modeles and not xgboost_disponible():
         p.error("xgboost demandé mais absent (pip install xgboost).")
     args.devices = {"xgboost": "cpu", "lightgbm": "cpu"} if args.cpu else detect_devices(args.modeles)
+    args.rapids_actif = RAPIDS_ACTIF
     log(f"Calcul : XGBoost={args.devices['xgboost']}, LightGBM={args.devices['lightgbm']}; "
         + ("RAPIDS actif : voir ses journaux GPU/CPU." if RAPIDS_ACTIF else "autres modèles sur CPU."))
     start = time.time()
-    collect = dict(rows=[], preds=[], ablation=[], perms=[], infos={})
+    suffix = f"canaux{args.canaux_origine}" if args.canaux_origine else ""
+    out = nouveau_dossier("binaire", prefixe=suffix)
+    collect = dict(rows=[], preds=[], ablation=[], perms=[], infos={}, modeles=[], out=out)
     entete("CLASSIFICATION BINAIRE TROUBLE / TÉMOINS (une base à la fois)")
     try:
+        args.fusion = args.fusion or dossier_fusion_defaut()
+        require(args.fusion is not None, "Aucune fusion trouvée ; lancer 04.")
+        fichiers = ["fusion.json", "partition_sujets.csv"] + [f"fenetres_{base}.csv" for base in args.bases]
+        empreintes = empreintes_fusion(args.fusion, fichiers)
+        collect["reprise"] = Reprise("binaire", args, empreintes, out)
         for b in args.bases:
             analyser_base(b, args, collect)
     except (OSError, ValueError) as exc:
         p.exit(1, f"Analyse arrêtée : {exc}\n")
 
-    suffix = f"canaux{args.canaux_origine}" if args.canaux_origine else ""
-    out = nouveau_dossier("binaire", prefixe=suffix)
     rows = pd.DataFrame(collect["rows"])
     rows.to_csv(out / "metriques_par_repetition.csv", index=False)
     summary = summarise(rows.drop(columns=[c for c in ["hyperparametres_choisis"] if c in rows]),
@@ -298,6 +337,10 @@ def main():
         "figures": figures, "ajustements_non_converges": Compteur.non_converges,
         "duree_s": round(time.time() - start, 1), "arguments": arguments_dict(args),
         "versions": versions(("numpy", "pandas", "scikit-learn", "matplotlib", "xgboost"))})
+    try:
+        ecrire_manifeste(out, args.fusion, empreintes, arguments_dict(args), collect["modeles"])
+    except (OSError, ValueError) as exc:
+        p.exit(1, f"Provenance invalide : {exc}\n")
     log(f"\nDurée : {time.time() - start:.0f} s")
     log(f"SORTIE : {out}")
 

@@ -12,6 +12,8 @@ import numpy as np
 import pandas as pd
 
 import eeg_gpu_entropies
+import eeg_reprise
+from eeg_modeles_sauvegardes import ecrire_manifeste, empreintes_fusion
 from eeg_config import BANDS, BASES, MEASURES, MESURES_ETENDUES, MULTIECHELLE, PUISSANCES
 from eeg_donnees import agreger, agreger_multiechelle, charger_extraction
 
@@ -30,12 +32,74 @@ extract = load_script("03_extraction_entropies")
 fusion = load_script("04_fusion_harmonisation")
 binary = load_script("05_classification_binaire")
 multiclass = load_script("06_classification_multiclasse")
+interpretation = load_script("09_interpretabilite")
 synthesis = load_script("10_synthese_resultats")
 loading = load_script("01_chargement_donnees")
 pipeline = load_script("00_pipeline")
 
 
 class ExtendedFeatureTests(unittest.TestCase):
+    def test_resume_rejects_changed_inputs_options_and_models(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source, second, third, fourth = (root / f"run{i}" for i in range(4))
+            for path in (source, second, third, fourth):
+                path.mkdir()
+            args = Namespace(fusion=root, reprendre=False, repetitions=1)
+            with patch.object(eeg_reprise, "dossier_etape", return_value=root):
+                first = eeg_reprise.Reprise("binaire", args, {"input": "a"}, source)
+                (source / "model.joblib").write_bytes(b"model")
+                first.enregistrer(["model", 1], {"score": 1}, ["model.joblib"])
+                args.reprendre = True
+                resume = eeg_reprise.Reprise("binaire", args, {"input": "a"}, second)
+                self.assertEqual(resume.charger(["model", 1]), {"score": 1})
+                args.repetitions = 2
+                changed = eeg_reprise.Reprise("binaire", args, {"input": "a"}, third)
+                self.assertIsNone(changed.charger(["model", 1]))
+                args.repetitions = 1
+                changed_input = eeg_reprise.Reprise("binaire", args, {"input": "b"}, fourth)
+                self.assertIsNone(changed_input.charger(["model", 1]))
+                (source / "model.joblib").write_bytes(b"changed")
+                with self.assertRaisesRegex(ValueError, "modifié"):
+                    resume.charger(["model", 1])
+
+    def test_manifest_rejects_fusion_changed_during_training(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "fusion"
+            source.mkdir()
+            path = source / "fenetres.csv"
+            path.write_text("before", encoding="utf-8")
+            fingerprints = empreintes_fusion(source, ["fenetres.csv"])
+            path.write_text("after", encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "Fusion modifiée pendant"):
+                ecrire_manifeste(root, source, fingerprints, {}, [])
+            self.assertFalse((root / "modeles.json").exists())
+
+    def test_pipeline_does_not_synthesize_stale_failed_outputs(self):
+        commands = []
+
+        class FakeProcess:
+            def __init__(self, cmd):
+                self.step = Path(cmd[1]).name[:2]
+                self.stdout = [f"SORTIE : {Path(cmd[1]).parent / '05_run'}\n"] if self.step == "05" else []
+
+            def wait(self):
+                return 1 if self.step == "09" else 0
+
+        def launch(cmd, **kwargs):
+            commands.append(Path(cmd[1]).name[:2])
+            return FakeProcess(cmd)
+
+        with tempfile.TemporaryDirectory() as tmp, \
+             patch.object(pipeline, "SCRIPT_DIR", Path(tmp)), \
+             patch.object(pipeline.subprocess, "Popen", side_effect=launch), \
+             patch.object(sys, "argv", ["00_pipeline.py", "--etapes", "5", "9", "10", "--continuer"]), \
+             self.assertRaises(SystemExit) as result:
+            pipeline.main()
+        self.assertNotEqual(result.exception.code, 0)
+        self.assertEqual(commands, ["05", "09"])
+
     def test_pairwise_backend_matches_cpu_entropy_calculations(self):
         rng = np.random.default_rng(42)
         signals = [rng.normal(size=73), np.repeat([0.0, 0.15, 0.3], 24)]
@@ -132,7 +196,9 @@ class ExtendedFeatureTests(unittest.TestCase):
                 self.stdout = ([f"SORTIE : {Path(cmd[1]).parent / 'sorties' / '03_extraction' / (b + '_run')}\n"
                                 for b in BASES] if step == "03" else
                                [f"SORTIE : {Path(cmd[1]).parent / 'sorties' / '04_fusion' / 'run'}\n"]
-                               if step == "04" else [])
+                               if step == "04" else
+                               [f"SORTIE : {Path(cmd[1]).parent / 'sorties' / (step + '_run')}\n"]
+                               if step in ("05", "06", "09") else [])
             def wait(self):
                 return 0
         def launch(cmd, **kwargs):
@@ -157,23 +223,30 @@ class ExtendedFeatureTests(unittest.TestCase):
         self.assertIn("--caracteristiques-etendues", by_step["04"])
         self.assertNotIn("--ablation", by_step["05"])
         self.assertIn("--shap", by_step["09"])
+        for step, option in (("05", "--binaire"), ("06", "--multiclasse")):
+            self.assertTrue(by_step["09"][by_step["09"].index(option) + 1].endswith(step + "_run"))
+        for step, option in (("05", "--binaire"), ("06", "--multiclasse"), ("09", "--interpretabilite")):
+            self.assertTrue(by_step["10"][by_step["10"].index(option) + 1].endswith(step + "_run"))
         for step in ("05", "06", "09"):
             self.assertIn("etendues_puissances", by_step[step])
             self.assertIn("--rapids", by_step[step])
+        for step in ("05", "06"):
+            self.assertIn("--reprendre", by_step[step])
         self.assertTrue(all("--permutations" not in cmd for cmd in commands))
 
     def test_pipeline_can_disable_rapids(self):
         commands = []
 
         class FakeProcess:
-            stdout = []
-
+            def __init__(self, cmd):
+                step = Path(cmd[1]).name[:2]
+                self.stdout = [f"SORTIE : {Path(cmd[1]).parent / (step + '_run')}\n"] if step in ("05", "06", "09") else []
             def wait(self):
                 return 0
 
         def launch(cmd, **kwargs):
             commands.append(cmd)
-            return FakeProcess()
+            return FakeProcess(cmd)
 
         with tempfile.TemporaryDirectory() as tmp, \
              patch.object(pipeline, "SCRIPT_DIR", Path(tmp)), \
@@ -184,6 +257,30 @@ class ExtendedFeatureTests(unittest.TestCase):
         self.assertEqual(result.exception.code, 0)
         self.assertEqual(len(commands), 3)
         self.assertTrue(all("--rapids" not in command for command in commands))
+
+    def test_pipeline_recalculer_disables_model_resume(self):
+        commands = []
+
+        class FakeProcess:
+            def __init__(self, cmd):
+                step = Path(cmd[1]).name[:2]
+                self.stdout = [f"SORTIE : {Path(cmd[1]).parent / (step + '_run')}\n"]
+
+            def wait(self):
+                return 0
+
+        def launch(cmd, **kwargs):
+            commands.append(cmd)
+            return FakeProcess(cmd)
+
+        with tempfile.TemporaryDirectory() as tmp, \
+             patch.object(pipeline, "SCRIPT_DIR", Path(tmp)), \
+             patch.object(pipeline.subprocess, "Popen", side_effect=launch), \
+             patch.object(sys, "argv", ["00_pipeline.py", "--etapes", "5", "6", "--recalculer"]), \
+             self.assertRaises(SystemExit) as result:
+            pipeline.main()
+        self.assertEqual(result.exception.code, 0)
+        self.assertTrue(all("--reprendre" not in command for command in commands))
 
     def test_pipeline_cache_records_entropy_backend(self):
         commands = []
@@ -241,12 +338,13 @@ class ExtendedFeatureTests(unittest.TestCase):
     def test_pipeline_passes_verified_cached_outputs_to_downstream_stages(self):
         commands = []
         class FakeProcess:
-            stdout = []
+            def __init__(self, cmd):
+                self.stdout = [f"SORTIE : {Path(cmd[1]).parent / (Path(cmd[1]).name[:2] + '_run')}\n"]
             def wait(self):
                 return 0
         def launch(cmd, **kwargs):
             commands.append(cmd)
-            return FakeProcess()
+            return FakeProcess(cmd)
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             paths = {
@@ -455,6 +553,81 @@ class ExtendedFeatureTests(unittest.TestCase):
                              set(split.loc[split.partition == "test", "groupe"]))
             self.assertTrue(split.groupby(["base", "label_binaire", "partition"]).size().ge(1).all())
 
+            b1, b2 = root / "resume_binary_1", root / "resume_binary_2"
+            for path in (b1, b2):
+                path.mkdir()
+            binary_args = ["05", "--fusion", str(fused), "--bases", "depression", "--modeles",
+                           "regression_logistique", "reference_majoritaire", "--sans-reference-amplitude",
+                           "--repetitions", "1", "--sans-tuning", "--cpu"]
+            original_binary = binary.cv_proba
+            calls = []
+
+            def interrupt_binary(*args, **kwargs):
+                calls.append(args[0])
+                if len(calls) == 2:
+                    raise ValueError("interruption simulée")
+                return original_binary(*args, **kwargs)
+
+            with patch.object(eeg_reprise, "dossier_etape", return_value=root), \
+                 patch.object(sys, "argv", binary_args), \
+                 patch.object(binary, "nouveau_dossier", return_value=b1), \
+                 patch.object(binary, "cv_proba", side_effect=interrupt_binary), \
+                 self.assertRaises(SystemExit):
+                binary.main()
+            with patch.object(eeg_reprise, "dossier_etape", return_value=root), \
+                 patch.object(sys, "argv", binary_args + ["--reprendre"]), \
+                 patch.object(binary, "nouveau_dossier", return_value=b2), \
+                 patch.object(binary, "cv_proba", wraps=original_binary) as fit:
+                binary.main()
+            self.assertEqual(fit.call_count, 1)
+            self.assertEqual(fit.call_args[0][0], "reference_majoritaire")
+            self.assertEqual(len(json.loads((b2 / "modeles.json").read_text(encoding="utf-8"))["modeles"]), 1)
+            self.assertTrue((b2 / "predictions_test.csv").is_file())
+
+            m1, m2, m3 = (root / f"resume_multi_{i}" for i in range(1, 4))
+            for path in (m1, m2, m3):
+                path.mkdir()
+            multi_args = ["06", "--fusion", str(fused), "--modeles", "regression_logistique",
+                          "--harmonisations", "zscore", "--plis", "3", "--repetitions", "1",
+                          "--sans-permutations", "--sans-tuning", "--cpu"]
+            original_multi = multiclass.cross_val_proba
+            calls = []
+
+            def interrupt_multi(*args, **kwargs):
+                calls.append(1)
+                if len(calls) == 3:
+                    raise ValueError("interruption simulée")
+                return original_multi(*args, **kwargs)
+
+            with patch.object(eeg_reprise, "dossier_etape", return_value=root), \
+                 patch.object(sys, "argv", multi_args), \
+                 patch.object(multiclass, "nouveau_dossier", return_value=m1), \
+                 patch.object(multiclass, "cross_val_proba", side_effect=interrupt_multi), \
+                 self.assertRaises(SystemExit):
+                multiclass.main()
+            with patch.object(eeg_reprise, "dossier_etape", return_value=root), \
+                 patch.object(sys, "argv", multi_args + ["--reprendre"]), \
+                 patch.object(multiclass, "nouveau_dossier", return_value=m2):
+                multiclass.main()
+            with patch.object(eeg_reprise, "dossier_etape", return_value=root), \
+                 patch.object(sys, "argv", multi_args + ["--reprendre"]), \
+                 patch.object(multiclass, "nouveau_dossier", return_value=m3), \
+                 patch.object(multiclass, "cross_val_proba", side_effect=AssertionError("recalcul CV")), \
+                 patch.object(multiclass, "tuned_model", side_effect=AssertionError("recalcul LODO")):
+                multiclass.main()
+            for name in ("predictions_test.csv", "multiclasse_metriques.csv",
+                         "controle_site_metriques.csv", "lodo_metriques.csv"):
+                pd.testing.assert_frame_equal(pd.read_csv(m2 / name), pd.read_csv(m3 / name))
+            resumed_interpretation = root / "resume_interpretation"
+            resumed_interpretation.mkdir()
+            interpret_args = ["09", "--binaire", str(b2), "--multiclasse", str(m3),
+                              "--fusion", str(fused), "--taches", "binaire_depression", "multiclasse",
+                              "--tirages", "1", "--cpu"]
+            with patch.object(sys, "argv", interpret_args), \
+                 patch.object(interpretation, "nouveau_dossier", return_value=resumed_interpretation):
+                interpretation.main()
+            self.assertTrue((resumed_interpretation / "importance_groupes.csv").is_file())
+
             binary_folds, multiclass_folds = [], []
             for feature_set, count in (("classiques", 100), ("etendues", 240), ("etendues_puissances", 280)):
                 bout = root / f"binary_{feature_set}"
@@ -507,6 +680,39 @@ class ExtendedFeatureTests(unittest.TestCase):
                                         .set_index("subject_id")["pli"].sort_index())
                 params = json.loads((mout / "controle_multiclasse.json").read_text(encoding="utf-8"))
                 self.assertEqual(params["arguments"]["caracteristiques"], feature_set)
+                if feature_set == "etendues_puissances":
+                    iout = root / "interpretation"
+                    iout.mkdir()
+                    argv = ["09", "--binaire", str(bout), "--multiclasse", str(mout),
+                            "--fusion", str(fused), "--taches", "binaire_depression", "multiclasse",
+                            "--modele", "regression_logistique", "--harmonisation", "zscore",
+                            "--tirages", "1", "--shap", "--shap-fond", "4", "--cpu"]
+                    with patch.object(sys, "argv", argv), \
+                         patch.object(interpretation, "nouveau_dossier", return_value=iout), \
+                         patch.object(interpretation.joblib, "load", wraps=interpretation.joblib.load) as load:
+                        interpretation.main()
+                    self.assertEqual(load.call_count, 2)
+                    shap = pd.read_csv(iout / "shap_valeurs.csv")
+                    self.assertEqual(set(shap["tache"]), {"binaire_depression", "multiclasse"})
+                    self.assertTrue(np.isfinite(shap["shap_abs_moyen"]).all())
+                    meta = json.loads((iout / "interpretabilite.json").read_text(encoding="utf-8"))
+                    self.assertEqual(meta["sources"]["binaire_depression"], str(bout.resolve()))
+                    self.assertEqual(meta["sources"]["multiclasse"], str(mout.resolve()))
+                    pred_path = bout / "predictions_test.csv"
+                    changed = pd.read_csv(pred_path)
+                    changed.loc[0, "proba_trouble"] = 0.123456
+                    changed.to_csv(pred_path, index=False)
+                    args_binary = ["09", "--binaire", str(bout), "--fusion", str(fused),
+                                   "--taches", "binaire_depression", "--tirages", "1", "--cpu"]
+                    with patch.object(sys, "argv", args_binary), \
+                         patch.object(interpretation, "nouveau_dossier", return_value=iout), \
+                         self.assertRaises(SystemExit) as failure:
+                        interpretation.main()
+                    self.assertEqual(failure.exception.code, 1)
+                    with (fused / "fenetres_communes.csv").open("a", encoding="utf-8") as file:
+                        file.write("\n")
+                    with self.assertRaisesRegex(ValueError, "Fusion absente ou modifiée"):
+                        interpretation.lire_manifeste(mout, fused)
             for folds in binary_folds[1:]:
                 pd.testing.assert_series_equal(binary_folds[0], folds)
             for folds in multiclass_folds[1:]:

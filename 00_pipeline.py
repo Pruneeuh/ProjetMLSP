@@ -6,8 +6,8 @@
     04 fusion + harmonisation             09 interprétabilité
     05 classification binaire             10 synthèse (IC 95 %, tableaux du rapport)
 
-Les sorties 01–04 sont réutilisées si leurs entrées, paramètres, code, dépendances et
-empreintes correspondent. --recalculer force leur exécution.
+Les sorties 01–04 et les calculs terminés de 05/06 sont réutilisés si leurs entrées,
+paramètres, code et dépendances correspondent. --recalculer force leur exécution.
 Une étape qui échoue arrête le pipeline (sauf --continuer, sauf pour 01–04) ; le journal de chaque étape est
 écrit dans sorties/journal_pipeline_<date>/<étape>.log.
 
@@ -48,8 +48,7 @@ RAPIDE = {
     6: ["--repetitions", "1", "--modeles", "regression_logistique", "--harmonisations", "zscore",
         "--profil-tuning", "quick", "--plis-internes", "2", "--tirages-tuning", "1", "--sans-lodo"],
     7: ["--repetitions", "1", "--epoques", "30"],
-    9: ["--repetitions", "1", "--tirages", "2", "--profil-tuning", "quick",
-        "--plis-internes", "2", "--tirages-tuning", "1"],
+    9: ["--repetitions", "1", "--tirages", "2"],
     10: ["--bootstrap", "300"],
 }
 OPTIONS_ANALYSE = {
@@ -97,7 +96,7 @@ def main():
     p.add_argument("--sans-rapids", action="store_true", help="Ne pas activer l'accélération RAPIDS en 05, 06 et 09.")
     p.add_argument("--cpu-entropies", action="store_true", help="Forcer le CPU pour l'extraction 03.")
     p.add_argument("--continuer", action="store_true", help="Continuer après un échec, sauf pour les étapes 01–04.")
-    p.add_argument("--recalculer", action="store_true", help="Recalculer 01–04 même si leurs sorties sont vérifiées.")
+    p.add_argument("--recalculer", action="store_true", help="Recalculer 01–06 sans réutiliser leurs calculs.")
     args = p.parse_args()
     etapes = [e for e in args.etapes if not (args.sans_reseaux and e == 7)]
     journal = SCRIPT_DIR / "sorties" / f"journal_pipeline_{datetime.now():%Y%m%d_%H%M%S}"
@@ -108,8 +107,17 @@ def main():
     bilan = []
     t_all = time.time()
     for e in etapes:
+        dependencies = {9: (5, 6), 10: (5, 6, 9)}.get(e, ())
+        if any(step in etapes and step not in resultats for step in dependencies):
+            print(f"Étape {e:02d} : résultats demandés du lancement absents ; étape arrêtée.")
+            bilan.append((e, ETAPES[e], 1, 0))
+            if not args.continuer:
+                break
+            continue
         cmd = [sys.executable, str(SCRIPT_DIR / ETAPES[e])]
         cmd += OPTIONS_ANALYSE.get(e, [])
+        if e in (5, 6) and not args.recalculer:
+            cmd.append("--reprendre")
         if args.sans_rapids and "--rapids" in cmd:
             cmd.remove("--rapids")
         calcul, gpu_info = None, None
@@ -148,12 +156,20 @@ def main():
         if e == 4:
             for base, path in zip(BASES, sorted(inputs, key=lambda p: BASES.index(p.name.split("_", 1)[0]))):
                 cmd += [f"--{base}", str(path)]
-        if e in (7, 8, 9) and 3 in resultats:
+        if e in (7, 8) and 3 in resultats:
             for path in resultats[3]:
                 base = path.name.split("_", 1)[0]
                 cmd += [f"--{base}", str(path)]
         if e in (5, 6, 7, 8, 9) and 4 in resultats:
             cmd += ["--fusion", str(resultats[4][0])]
+        if e == 9:
+            for step, option in ((5, "--binaire"), (6, "--multiclasse")):
+                if step in resultats:
+                    cmd += [option, str(resultats[step][0])]
+        if e == 10:
+            for step, option in ((5, "--binaire"), (6, "--multiclasse"), (9, "--interpretabilite")):
+                if step in resultats:
+                    cmd += [option, str(resultats[step][0])]
         if e == 10 and not any(step == 7 and code == 0 for step, _, code, _ in bilan):
             cmd += ["--sans-profond"]
         if args.rapide:
@@ -188,6 +204,12 @@ def main():
             except (OSError, ValueError) as exc:
                 print(f"Étape {e:02d} : sortie non vérifiable : {exc}", flush=True)
                 code = 1
+        elif code == 0 and e in (5, 6, 9):
+            if len(sorties) != 1:
+                print(f"Étape {e:02d} : dossier de sortie unique introuvable.", flush=True)
+                code = 1
+            else:
+                resultats[e] = sorties
         duree = time.time() - t0
         bilan.append((e, ETAPES[e], code, duree))
         if code != 0:

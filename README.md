@@ -87,10 +87,20 @@ facultative. Chaque script accepte `--help`.
 
 Lance les étapes dans des processus séparés, conserve leurs journaux et transmet les sorties.
 Les sorties 01–04 sont réutilisées seulement si leurs données, code, paramètres, versions et
-empreintes correspondent. **Pourquoi :** éviter de recalculer l'extraction coûteuse sans
-réutiliser silencieusement des résultats périmés. `--recalculer` force 01–04 ; les données
-source doivent rester disponibles pour vérifier le cache. Les étapes 05–10 ne sont pas
-mises en cache. Une erreur en 01–04 arrête toujours le lanceur.
+empreintes correspondent. En 05/06, les calculs terminés sont sauvegardés au fur et à
+mesure : relancer le même pipeline reprend les modèles compatibles plutôt que de les
+réentraîner. Les références, contrôles de site et LODO sont aussi sauvegardés. Les analyses
+optionnelles d'ablation et de permutation sont reprises par bloc terminé ; un bloc
+interrompu est recalculé. Les anciens résultats sans checkpoints ne peuvent pas être repris.
+
+La reprise exige les mêmes données de fusion, options, code, versions et configuration de
+calcul ; chaque lancement écrit un nouveau dossier et copie les modèles repris. Les
+checkpoints prennent de l'espace disque et, comme les modèles `joblib`, ne doivent être
+chargés que depuis des sources de confiance. Pour les scripts 05/06 lancés directement,
+ajouter `--reprendre`. **Pourquoi :** éviter les recalculs sans réutiliser silencieusement
+des résultats incompatibles. `--recalculer` force 01–06 ; les données source doivent rester
+disponibles pour vérifier le cache. Les étapes 07–10 ne sont pas mises en cache. Une erreur
+en 01–04 arrête toujours le lanceur.
 
 ### 01 — Chargement et doublons
 
@@ -203,11 +213,25 @@ sont causées par le trouble.
 
 ### 09 — Interprétabilité
 
-Ajuste des modèles **distincts**, sur des caractéristiques agrégées par participant, et
-calcule des importances par permutation de groupes de variables et, avec le lanceur, SHAP
-hors pli. Son CV utilise tous les participants, y compris ceux du test de 04.
-**Pourquoi :** explorer les variables associées aux prédictions de ces modèles, sans
-prétendre expliquer directement les modèles sur fenêtres de 05/06.
+Charge les modèles sur fenêtres effectivement ajustés et sauvegardés par 05/06, vérifie
+la fusion et reproduit leurs probabilités test avant de les expliquer. Par défaut, il
+explique la régression logistique ; `--modele` permet de choisir un autre modèle sauvegardé.
+Pour 06, `--harmonisation` accepte `zscore` ou `aucune` : les autres transformations ne
+sont pas prises en charge pour cette interprétation par variable. Les références
+majoritaire, d'amplitude et de nombre de canaux ne sont pas sauvegardées pour 09.
+
+Le lanceur active SHAP et les importances par permutation de groupes. SHAP est calculé par
+fenêtre, puis les valeurs absolues sont moyennées par participant et entre participants :
+chaque participant a le même poids, même si les durées diffèrent. Ce n'est pas une valeur
+SHAP directement calculée sur la moyenne des probabilités du participant. Les permutations
+échangent les trajectoires des variables entre participants ; les longueurs différentes
+sont rééchantillonnées par indices relatifs.
+
+**Pourquoi :** explorer les caractéristiques utilisées par les modèles réellement
+entraînés, sans considérer les fenêtres d'un même participant comme des personnes
+indépendantes. Les explications portent sur le même test que 05/06 : leur utilisation
+pour choisir des caractéristiques rend ce test impropre à une évaluation finale
+indépendante.
 
 ### 10 — Synthèse
 
@@ -245,7 +269,7 @@ provenance avant de comparer des analyses différentes.
   caractéristique technique plutôt qu'un effet clinique.
 - La séparation par groupe réduit les fuites connues, mais ne garantit pas leur absence.
   Choisir le meilleur modèle après avoir comparé les scores du même test rend l'estimation
-  optimiste. Utiliser les résultats 08/09 sur tous les sujets pour choisir des variables,
+  optimiste. Utiliser les résultats 08 ou les explications 09 pour choisir des variables,
   puis présenter 05/06 sur ce même test comme une évaluation finale indépendante, contamine
   également cette évaluation.
 - Les ordres de canaux Borisov et Sakib et leurs unités restent à vérifier ; les valeurs
@@ -266,6 +290,13 @@ provenance avant de comparer des analyses différentes.
 - Les résultats et journaux sont écrits dans `sorties/`. Utiliser `--etapes` pour lancer
   certaines étapes, par exemple `python 00_pipeline.py --etapes 7 10`. Les options propres
   à une étape se règlent en lançant directement son script.
+- 05/06 sauvegardent les modèles et leur provenance dans leurs dossiers de sortie ; cela
+  utilise de l'espace disque. Les anciennes exécutions sans `modeles.json` doivent être
+  relancées avant 09. La fusion d'origine doit rester accessible et inchangée. Charger
+  uniquement des modèles `joblib` de confiance, avec un environnement compatible : ces
+  fichiers peuvent exécuter du code lors de leur chargement.
+- Avec `--continuer`, 09 ou 10 ne réutilise pas des résultats anciens lorsqu'une étape
+  05, 06 ou 09 demandée pour ce lancement a échoué.
 - `entropy_classification.ipynb` est un workflow distinct. Ses anciennes sorties peuvent
   précéder l'exclusion de Borisov ; ses analyses au niveau participant et au niveau
   fenêtre ne sont pas une comparaison contrôlée à caractéristiques identiques.

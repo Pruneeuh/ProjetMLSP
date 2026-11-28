@@ -7,6 +7,7 @@ Sortie  : sorties/06_multiclasse/<date>/
     matrice_confusion_<modèle>__<harmonisation>.png  (4 classes + témoins séparés par base)
     controle_site_metriques.csv, controle_site_resume.csv, controle_site_temoins.png
     permutations.csv, lodo_metriques.csv, lodo_resume.csv
+    modeles/ et modeles.json modèles principaux ajustés et provenance pour l'étape 09
     controle_multiclasse.json
 
   1. Harmonisation (--harmonisations zscore filtrage coral filtrage_coral), toujours ajustée DANS
@@ -57,10 +58,13 @@ from sklearn.metrics import confusion_matrix, recall_score
 
 import eeg_harmonisation as eh
 from eeg_config import BASES, CLASS_OF_BASE, CLASSES, GRAINE
+from eeg_donnees import dossier_fusion_defaut
 from eeg_fenetres import charger_fenetres, moyenner_sujets, plis_groupes
+from eeg_modeles_sauvegardes import ecrire_manifeste, empreintes_fusion, sauvegarder_modele
+from eeg_reprise import Reprise
 from eeg_utils import (Compteur, arguments_dict, ecrire_json, entete, fmt_table, log,
                        multiclass_scores, nouveau_dossier, p_valeur_permutation, plot_confusion, plt_agg,
-                       summarise, versions, xgboost_disponible)
+                       require, summarise, versions, xgboost_disponible)
 
 
 def tuned_model(nom, x, y, groups, strata, bases, ref, method, seed, args):
@@ -71,7 +75,7 @@ def tuned_model(nom, x, y, groups, strata, bases, ref, method, seed, args):
 
 
 def cross_val_proba(y, folds, x, bases, ref, groups, strata, method, nom, n_classes, seed, args,
-                    tuning=None, context=None):
+                    tuning=None, context=None, modeles=None):
     proba = np.zeros((len(y), n_classes))
     fold_id = np.zeros(len(y), dtype=int)
     n_variables = None
@@ -80,6 +84,8 @@ def cross_val_proba(y, folds, x, bases, ref, groups, strata, method, nom, n_clas
                                     bases[tr], ref[tr], method, seed, args)
         x_tr, x_te = eh.harmonise(x[tr], x[te], bases[tr], bases[te], ref[tr], method)
         model.fit(x_tr, y[tr])
+        if modeles is not None:
+            modeles.append(model)
         proba[te] = predict_proba(model, x_te, n_classes)
         fold_id[te] = k
         if n_variables is None:
@@ -98,7 +104,7 @@ def strates(meta):
 
 
 # --------------------------------------------------------------------------- analyses
-def main_analysis(x_by_feat, meta, args, specs, tuning, holdout=False):
+def main_analysis(x_by_feat, meta, args, specs, tuning, holdout=False, sauvegarde=None):
     if "subject_id" not in meta:
         meta = meta.assign(subject_id=meta.index)
     y = meta["classe"].to_numpy()
@@ -120,10 +126,26 @@ def main_analysis(x_by_feat, meta, args, specs, tuning, holdout=False):
         for spec in specs:
             t0 = time.time()
             key = (spec["caracteristiques"], spec["harmonisation"])
-            proba, fold_id, n_variables = cross_val_proba(
-                y, folds, x_by_feat[key[0]], bases, ref, groups, strata, key[1], spec["kind"],
-                len(CLASSES), seed, args, tuning,
-                dict(tache="multiclasse", modele=spec["modele"], harmonisation=key[1], repetition=rep + 1))
+            checkpoint = sauvegarde.get("reprise") if sauvegarde is not None else None
+            cle = ["principal", spec["modele"], key[0], key[1], rep + 1]
+            saved = checkpoint.charger(cle) if checkpoint else None
+            if saved is None:
+                modeles = [] if sauvegarde is not None and key[0] == "entropies" and spec["modele"] != "reference_majoritaire" else None
+                choix = []
+                proba, fold_id, n_variables = cross_val_proba(
+                    y, folds, x_by_feat[key[0]], bases, ref, groups, strata, key[1], spec["kind"],
+                    len(CLASSES), seed, args, choix,
+                    dict(tache="multiclasse", modele=spec["modele"], harmonisation=key[1], repetition=rep + 1),
+                    modeles)
+                record = (sauvegarder_modele(sauvegarde["out"], "multiclasse", spec["modele"],
+                                             key[1], rep + 1, modeles[0]) if modeles is not None else None)
+                saved = (proba, fold_id, n_variables, choix, record)
+                if checkpoint:
+                    checkpoint.enregistrer(cle, saved, [record["fichier"]] if record else [])
+            proba, fold_id, n_variables, choix, record = saved
+            tuning.extend(choix)
+            if record is not None:
+                sauvegarde["modeles"].append(record)
             evaluate = np.concatenate([te for _, te in folds])
             participants, p = moyenner_sujets(meta.iloc[evaluate], y[evaluate], proba[evaluate])
             yt = participants["classe"].to_numpy()
@@ -152,7 +174,7 @@ def main_analysis(x_by_feat, meta, args, specs, tuning, holdout=False):
     return pd.DataFrame(rows), pd.concat(preds, ignore_index=True), confusion, detail
 
 
-def site_controls(x_by_feat, meta, args, kinds):
+def site_controls(x_by_feat, meta, args, kinds, reprise=None):
     """(a) tous les sujets et (b) témoins seulement : prédire la base d'origine."""
     rows = []
     base_codes = pd.Categorical(meta["base"], BASES).codes.astype(int)
@@ -172,12 +194,18 @@ def site_controls(x_by_feat, meta, args, kinds):
             for feat in ["entropies", "amplitude"]:
                 for method in methods:
                     for kind in kinds:
-                        proba, _, _ = cross_val_proba(y, folds, x_by_feat[feat][mask], bases, ref,
-                                                      groups, strata, method, kind, len(BASES), seed, args)
-                        participants, p = moyenner_sujets(meta.loc[mask], y, proba)
-                        row, _ = multiclass_scores(participants["classe"], p, list(range(len(BASES))))
-                        rows.append(dict(population=population, caracteristiques=feat, harmonisation=method,
-                                         modele=kind, repetition=rep + 1, **row))
+                        cle = ["site", population, feat, method, kind, rep + 1]
+                        result = reprise.charger(cle) if reprise else None
+                        if result is None:
+                            proba, _, _ = cross_val_proba(y, folds, x_by_feat[feat][mask], bases, ref,
+                                                          groups, strata, method, kind, len(BASES), seed, args)
+                            participants, p = moyenner_sujets(meta.loc[mask], y, proba)
+                            row, _ = multiclass_scores(participants["classe"], p, list(range(len(BASES))))
+                            result = dict(population=population, caracteristiques=feat, harmonisation=method,
+                                          modele=kind, repetition=rep + 1, **row)
+                            if reprise:
+                                reprise.enregistrer(cle, result)
+                        rows.append(result)
         log(f"  {population} : {time.time() - t0:.0f} s")
     return pd.DataFrame(rows)
 
@@ -198,7 +226,7 @@ def permute_labels(meta, rng, mode):
     return classe.astype(int), lab.astype(int)
 
 
-def permutation_tests(x_by_feat, meta, args, observed, specs):
+def permutation_tests(x_by_feat, meta, args, observed, specs, reprise=None):
     rows = []
     bases = meta["base"].to_numpy()
     groups = meta["groupe"].to_numpy()
@@ -211,20 +239,25 @@ def permutation_tests(x_by_feat, meta, args, observed, specs):
             scores = []
             for i in range(args.permutations):
                 classe, lab = permute_labels(meta, rng, mode)
-                repeat_scores = []
-                for rep in range(args.repetitions):
-                    seed = args.graine + rep
-                    strata = base_codes * 2 + lab
-                    try:
-                        folds = plis_groupes(strata, groups, args.plis, seed)
-                    except ValueError as exc:
-                        log(f"    permutation {i + 1} ignorée : {exc}")
-                        break
-                    proba, _, _ = cross_val_proba(
-                        classe, folds, x_by_feat[spec["caracteristiques"]], bases, classe == 0,
-                        groups, strata, spec["harmonisation"], spec["kind"], len(CLASSES), seed, args)
-                    participants, p = moyenner_sujets(meta, classe, proba)
-                    repeat_scores.append(multiclass_scores(participants["classe"], p, labels)[0])
+                cle = ["permutation", spec["modele"], spec["caracteristiques"], spec["harmonisation"], mode, i]
+                repeat_scores = reprise.charger(cle) if reprise else None
+                if repeat_scores is None:
+                    repeat_scores = []
+                    for rep in range(args.repetitions):
+                        seed = args.graine + rep
+                        strata = base_codes * 2 + lab
+                        try:
+                            folds = plis_groupes(strata, groups, args.plis, seed)
+                        except ValueError as exc:
+                            log(f"    permutation {i + 1} ignorée : {exc}")
+                            break
+                        proba, _, _ = cross_val_proba(
+                            classe, folds, x_by_feat[spec["caracteristiques"]], bases, classe == 0,
+                            groups, strata, spec["harmonisation"], spec["kind"], len(CLASSES), seed, args)
+                        participants, p = moyenner_sujets(meta, classe, proba)
+                        repeat_scores.append(multiclass_scores(participants["classe"], p, labels)[0])
+                    if reprise:
+                        reprise.enregistrer(cle, repeat_scores)
                 if len(repeat_scores) != args.repetitions:
                     continue
                 scores.append(pd.DataFrame(repeat_scores).mean().to_dict())
@@ -244,7 +277,7 @@ def permutation_tests(x_by_feat, meta, args, observed, specs):
     return pd.DataFrame(rows)
 
 
-def lodo(x_by_feat, meta, args, specs):
+def lodo(x_by_feat, meta, args, specs, reprise=None):
     rows = []
     bases = meta["base"].to_numpy()
     y = meta["label_binaire"].to_numpy()
@@ -270,6 +303,11 @@ def lodo(x_by_feat, meta, args, specs):
                 cache = {}
                 for spec in specs:
                     key = (spec["caracteristiques"], spec["harmonisation"])
+                    cle = ["lodo", test_base, mode, rep + 1, spec["modele"], *key]
+                    result = reprise.charger(cle) if reprise else None
+                    if result is not None:
+                        rows.append(result)
+                        continue
                     if key not in cache:
                         x = x_by_feat[key[0]]
                         cache[key] = eh.harmonise(x[tr], x[te], bases[tr], bases[te], ref_tr, key[1],
@@ -284,9 +322,12 @@ def lodo(x_by_feat, meta, args, specs):
                     row, pred = multiclass_scores(yt, p, [0, 1])
                     row["sensibilite"] = recall_score(yt, pred, zero_division=0)
                     row["specificite"] = recall_score(yt, pred, pos_label=0, zero_division=0)
-                    rows.append(dict(base_test=test_base, harmonisation_base_test=mode, modele=spec["modele"],
-                                     harmonisation=spec["harmonisation"], repetition=rep + 1,
-                                     n_test=len(yt), temoins_test=int((yt == 0).sum()), **row))
+                    result = dict(base_test=test_base, harmonisation_base_test=mode, modele=spec["modele"],
+                                  harmonisation=spec["harmonisation"], repetition=rep + 1,
+                                  n_test=len(yt), temoins_test=int((yt == 0).sum()), **row)
+                    if reprise:
+                        reprise.enregistrer(cle, result)
+                    rows.append(result)
         log(f"  base test {test_base} : terminé")
     return pd.DataFrame(rows)
 
@@ -373,6 +414,7 @@ def main():
     p.add_argument("--sans-controles-site", action="store_true")
     p.add_argument("--sans-permutations", action="store_true")
     p.add_argument("--sans-lodo", action="store_true")
+    p.add_argument("--reprendre", action="store_true", help="Réutiliser les calculs terminés compatibles.")
     args = p.parse_args()
     if (args.plis < 2 or args.repetitions < 1 or args.permutations < 0
             or (args.plis_internes is not None and args.plis_internes < 2)
@@ -385,6 +427,7 @@ def main():
     if "xgboost" in args.modeles + args.permutation_modeles and not xgboost_disponible():
         p.error("xgboost demandé mais absent (pip install xgboost).")
     args.devices = {"xgboost": "cpu", "lightgbm": "cpu"} if args.cpu else detect_devices(args.modeles + args.permutation_modeles)
+    args.rapids_actif = RAPIDS_ACTIF
     log(f"Calcul : XGBoost={args.devices['xgboost']}, LightGBM={args.devices['lightgbm']}; "
         + ("RAPIDS actif : voir ses journaux GPU/CPU." if RAPIDS_ACTIF else "autres modèles sur CPU."))
     args.harmonisations = list(dict.fromkeys(args.harmonisations))
@@ -392,6 +435,9 @@ def main():
 
     start = time.time()
     try:
+        args.fusion = args.fusion or dossier_fusion_defaut()
+        require(args.fusion is not None, "Aucune fusion trouvée ; lancer 04.")
+        empreintes = empreintes_fusion(args.fusion, ["fusion.json", "partition_sujets.csv", "fenetres_communes.csv"])
         ent, amp, meta, finfo, fdir = charger_fenetres(args.fusion, choix=args.caracteristiques)
         common = finfo["canaux_communs"]
     except (OSError, ValueError) as exc:
@@ -423,8 +469,11 @@ def main():
     figures, site_summary, perm, lodo_summary = [], None, None, None
     tuning = []
     try:
+        reprise = Reprise("multiclasse", args, empreintes, out)
+        sauvegarde = {"out": out, "modeles": [], "reprise": reprise}
         log("\n[1/4] Classification 4 classes")
-        metrics, preds, confusion, detail = main_analysis(x_by_feat, meta, args, specs, tuning, holdout=True)
+        metrics, preds, confusion, detail = main_analysis(
+            x_by_feat, meta, args, specs, tuning, holdout=True, sauvegarde=sauvegarde)
         summary = summarise(metrics, ["tache", "harmonisation", "modele"])
         metrics.to_csv(out / "multiclasse_metriques.csv", index=False)
         summary.to_csv(out / "multiclasse_resume.csv", index=False)
@@ -439,7 +488,7 @@ def main():
         if not args.sans_controles_site:
             log("\n[2/4] Contrôles de site en validation croisée sur train seulement")
             kinds = [k for k in ["regression_logistique", "mlp", "xgboost"] if k in args.modeles] or ["regression_logistique"]
-            site = site_controls(train_x, train_meta, args, kinds)
+            site = site_controls(train_x, train_meta, args, kinds, reprise)
             site_summary = summarise(site, ["population", "caracteristiques", "harmonisation", "modele"])
             site.to_csv(out / "controle_site_metriques.csv", index=False)
             site_summary.to_csv(out / "controle_site_resume.csv", index=False)
@@ -450,18 +499,21 @@ def main():
             pspecs = [s for s in specs if s["modele"] in args.permutation_modeles and s["harmonisation"] != "aucune"]
             if not pspecs:
                 raise ValueError("Aucun modèle de permutation n'est sélectionné dans --modeles.")
-            observed, _, _, _ = main_analysis(train_x, train_meta, args, pspecs, [])
-            perm = permutation_tests(train_x, train_meta, args, observed, pspecs)
+            observed = reprise.charger(["permutation", "observe"])
+            if observed is None:
+                observed, _, _, _ = main_analysis(train_x, train_meta, args, pspecs, [])
+                reprise.enregistrer(["permutation", "observe"], observed)
+            perm = permutation_tests(train_x, train_meta, args, observed, pspecs, reprise)
             perm.to_csv(out / "permutations.csv", index=False)
 
         if not args.sans_lodo:
             log("\n[4/4] Leave-one-dataset-out (trouble contre témoin)")
             lspecs = [s for s in specs if s["harmonisation"] != "aucune"]
-            lodo_df = lodo(train_x, train_meta, args, lspecs)
+            lodo_df = lodo(train_x, train_meta, args, lspecs, reprise)
             lodo_summary = summarise(lodo_df, ["base_test", "harmonisation_base_test", "harmonisation", "modele"])
             lodo_df.to_csv(out / "lodo_metriques.csv", index=False)
             lodo_summary.to_csv(out / "lodo_resume.csv", index=False)
-    except ValueError as exc:
+    except (OSError, ValueError) as exc:
         p.exit(1, f"Analyse arrêtée : {exc}\n")
 
     # ------------------------------------------------------------------ résumé console
@@ -534,6 +586,10 @@ def main():
         "figures": figures, "ajustements_non_converges": Compteur.non_converges,
         "duree_s": round(time.time() - start, 1), "arguments": arguments_dict(args),
         "versions": versions(("numpy", "pandas", "scikit-learn", "matplotlib", "xgboost"))})
+    try:
+        ecrire_manifeste(out, fdir, empreintes, arguments_dict(args), sauvegarde["modeles"])
+    except (OSError, ValueError) as exc:
+        p.exit(1, f"Provenance invalide : {exc}\n")
     log(f"\nDurée : {time.time() - start:.0f} s")
     log(f"SORTIE : {out}")
 
