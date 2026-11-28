@@ -6,7 +6,7 @@ Sortie  : sorties/04_fusion/<date>/
     entropies_sujets.csv     une ligne par sujet, colonnes « canal|bande|mesure »
                              (10 canaux × 5 composantes × 5 mesures = 250 variables)
     amplitude_sujets.csv     log de l'écart-type avant standardisation, « log_sd|canal|bande »
-    entropies_etendues_sujets.csv, puissances_sujets.csv (--caracteristiques-etendues)
+    entropies_etendues_sujets.csv, puissances_sujets.csv, entropies_multiechelle_sujets.csv
     meta_sujets.csv          base, label_binaire, classe (0 témoin, 1 dépression, 2 schizophrénie,
                              3 anxiété), groupe de validation, nombre de fenêtres
     fusion.json              canaux communs, correspondances, effectifs, dossiers source
@@ -43,7 +43,7 @@ import pandas as pd
 
 import eeg_harmonisation as eh
 from eeg_config import BANDS, BASES, CANAUX, CLASSES, MEASURES, MESURES_ETENDUES, ORDRE_SUPPOSE, PUISSANCES
-from eeg_donnees import (agreger, ajouter_arguments_extraction, construire_fusion, decomposer_colonnes, dossiers_extraction,
+from eeg_donnees import (agreger, agreger_multiechelle, ajouter_arguments_extraction, construire_fusion, decomposer_colonnes, dossiers_extraction,
                          lire_carte_canaux)
 from eeg_utils import arguments_dict, ecrire_json, entete, log, nouveau_dossier, plt_agg, versions
 
@@ -56,8 +56,12 @@ def main():
     p.add_argument("--filtrage-fraction", type=float, default=0.5)
     p.add_argument("--filtrage-arbres", type=int, default=200)
     p.add_argument("--sans-diagnostic", action="store_true", help="Seulement la fusion (pas d'harmonisation descriptive).")
-    p.add_argument("--caracteristiques-etendues", action="store_true",
-                   help="Fusionner aussi ApEn, PermEn, Shannon amplitude et les énergies DWT de 03.")
+    features = p.add_mutually_exclusive_group()
+    features.add_argument("--caracteristiques-etendues", dest="caracteristiques_etendues",
+                          action="store_true", default=True,
+                          help="Fusionner aussi entropies étendues, multiéchelles et énergies (défaut).")
+    features.add_argument("--sans-caracteristiques-etendues", dest="caracteristiques_etendues",
+                          action="store_false", help="Fusion classique seulement, pour les anciennes extractions.")
     args = p.parse_args()
     eh.configurer(args)
     try:
@@ -66,6 +70,7 @@ def main():
         if args.caracteristiques_etendues:
             extras = pd.concat([agreger(infos[b], common, MESURES_ETENDUES)[0] for b in BASES]).reindex(meta.index)
             power = pd.concat([agreger(infos[b], common, PUISSANCES)[0] for b in BASES]).reindex(meta.index)
+            multi = pd.concat([agreger_multiechelle(infos[b], common) for b in BASES]).reindex(meta.index)
     except (OSError, ValueError) as exc:
         p.exit(1, f"Fusion arrêtée : {exc}\n")
     out = nouveau_dossier("fusion")
@@ -92,6 +97,7 @@ def main():
     if args.caracteristiques_etendues:
         extras.to_csv(out / "entropies_etendues_sujets.csv")
         power.to_csv(out / "puissances_sujets.csv")
+        multi.to_csv(out / "entropies_multiechelle_sujets.csv")
     info = {
         "portee": "Fusion des 3 bases ; ordre des électrodes schizophrénie/anxiété supposé sauf --carte-canaux.",
         "dossiers_extraction": {b: str(runs[b]) for b in BASES},

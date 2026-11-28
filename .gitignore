@@ -8,3 +8,4 @@ outputs/window_*.csv
 __pycache__/
 outputs/*_extra_features.csv
 outputs/extra_features.log
+sorties/

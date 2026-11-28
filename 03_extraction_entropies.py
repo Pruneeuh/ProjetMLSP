@@ -1,6 +1,6 @@
-"""Étape 3 : prétraitement, fenêtrage, DWT (5 composantes) et calcul des 5 entropies.
+"""Étape 3 : prétraitement, fenêtrage et extraction des caractéristiques EEG.
 
-Entrée  : sorties/01_donnees/<base>_signals.npz + <base>_metadata.csv (01_chargement_donnees.py)
+Entrée  : sorties/02_controle_qualite/<date>/<base>_signals.npz et métadonnées (02)
 Sortie  : sorties/03_extraction/<base>_<date>/
     features_windows.csv       format LONG, une ligne par fenêtre × canal × composante :
                                dataset, subject_id, group_validation, label, window, channel, band,
@@ -10,15 +10,16 @@ Sortie  : sorties/03_extraction/<base>_<date>/
     audit_enregistrements.csv  un fichier source par ligne (statut extrait / doublon_exclu_de_analyse /
                                ..., nombre de fenêtres et de lignes, empreinte du signal)
     features_large.csv         (option --large) une ligne par fenêtre, colonnes canal_bande_mesure
+    features_sujets.csv        moyennes des fenêtres par participant × canal × composante
     parametres_extraction.json
 
-Avec --caracteristiques-etendues : ApEn, PermEn, Shannon_amplitude, LogPower et RelPower.
+ApEn, PermEn, Shannon_amplitude, LogPower et RelPower sont toujours calculés.
+RCMSE et RCMPE sont calculées sur chaque canal large bande aux échelles 1 à 10 ;
+elles figurent uniquement sur la ligne A4 pour ne pas les répéter par bande DWT.
 LogPower est le log10 de l'énergie DWT en µV², pas une puissance moyenne.
 
 Chaîne de traitement, pour chaque enregistrement :
-  1. filtre Butterworth passe-bande 0,5-45 Hz (ordre 4, phase nulle), coupe-bande secteur en option ;
-  2. rééchantillonnage à 128 Hz (Mumtaz 256 → 128 Hz) pour que les composantes DWT
-     couvrent les mêmes bandes dans les 3 bases ;
+  1. filtre Butterworth passe-bande 0,5-45 Hz et rééchantillonnage à 128 Hz effectués par 02 ;
   3. troncature optionnelle (--duree-max, ex. 60 s pour égaliser avec Borisov) ;
   4. fenêtres de --fenetre s (défaut 10 s), chevauchement --chevauchement ;
   5. DWT db4 niveau 4 → A4 (0-4 Hz), D4 (4-8), D3 (8-16), D2 (16-32), D1 (32-64, tronquée à 45) ;
@@ -38,10 +39,11 @@ Usage :
     python 03_extraction_entropies.py --fenetre 10 --chevauchement 0.5 --duree-max 60
     python 03_extraction_entropies.py --entropyhub --caracteristiques-etendues --large
 
-Dépendances : pip install numpy scipy pandas pywavelets   (+ EntropyHub pour --entropyhub ou --caracteristiques-etendues)
+Dépendances : numpy scipy pandas pywavelets EntropyHub
 """
 import argparse
-import math
+import hashlib
+import json
 import os
 import time
 from concurrent.futures import ProcessPoolExecutor
@@ -50,38 +52,19 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import pywt
-from scipy.signal import butter, iirnotch, resample_poly, sosfiltfilt, filtfilt, welch
+from scipy.signal import welch
 from scipy.special import ndtr
+from scipy.spatial import cKDTree
 
-from eeg_config import AMPLITUDE, BANDPASS, BANDS, BASES, FS_CIBLE, MEASURES, MESURES_ETENDUES, PUISSANCES
+from eeg_config import AMPLITUDE, BANDPASS, BANDS, BASES, FS_CIBLE, MEASURES, MESURES_ETENDUES, MULTIECHELLE, PUISSANCES
 from eeg_donnees import canaux_sauvegardes, charger_signaux
-from eeg_utils import arguments_dict, ecrire_json, log, nouveau_dossier, versions
+from eeg_pretraitement import bandpass, notch, pretraiter, reechantillonner
+from eeg_utils import arguments_dict, dernier_dossier, ecrire_json, log, nouveau_dossier, versions
 
 
 # --------------------------------------------------------------------------
 # Prétraitement
 # --------------------------------------------------------------------------
-def bandpass(sig, fs, low=BANDPASS[0], high=BANDPASS[1]):
-    """Filtre Butterworth passe-bande, phase nulle. sig : (canaux, échantillons)."""
-    high = min(high, 0.95 * fs / 2)
-    sos = butter(4, [low, high], btype="bandpass", fs=fs, output="sos")
-    return sosfiltfilt(sos, sig, axis=-1)
-
-
-def notch(sig, fs, f0):
-    if not f0 or f0 >= fs / 2:
-        return sig
-    b, a = iirnotch(f0, Q=30, fs=fs)
-    return filtfilt(b, a, sig, axis=-1)
-
-
-def reechantillonner(sig, fs, fs_cible=FS_CIBLE):
-    if int(round(fs)) == fs_cible:
-        return sig
-    g = math.gcd(int(round(fs)), fs_cible)
-    return resample_poly(sig, fs_cible // g, int(round(fs)) // g, axis=-1)
-
-
 def make_windows(n_samples, fs, win_sec, overlap):
     """Taille et indices de début des fenêtres de durée fixe."""
     if not 0 <= overlap < 1:
@@ -256,16 +239,53 @@ def mesures_etendues(coef):
     return values
 
 
+def entropies_multiechelle(signal, scales=10):
+    """RCMSE et RCMPE sur le signal large bande, selon Xu et al. (2025)."""
+    signal = np.asarray(signal, dtype=np.float64)
+    if not np.isfinite(signal).all() or signal.std() == 0:
+        return {f"{name}_{scale:02d}": np.nan
+                for name in ("RCMSE", "RCMPE") for scale in range(1, scales + 1)}
+    x = (signal - signal.mean()) / signal.std()
+    result = {}
+    for scale in range(1, scales + 1):
+        counts_m = counts_next = 0
+        pattern_probabilities = {}
+        for offset in range(scale):
+            n = (len(x) - offset) // scale
+            coarse = x[offset:offset + n * scale].reshape(n, scale).mean(axis=1)
+            if len(coarse) < 5:
+                raise ValueError(f"Série trop courte pour l'échelle {scale}")
+            templates = np.lib.stride_tricks.sliding_window_view(coarse, 3)
+            for dim in (2, 3):
+                tree = cKDTree(templates[:, :dim])
+                pairs = (tree.count_neighbors(tree, 0.15, p=np.inf) - len(templates)) / 2
+                if dim == 2:
+                    counts_m += pairs
+                else:
+                    counts_next += pairs
+            patterns = np.argsort(np.lib.stride_tricks.sliding_window_view(coarse, 4),
+                                  axis=1, kind="stable")
+            unique, counts = np.unique(patterns, axis=0, return_counts=True)
+            for pattern, count in zip(unique, counts):
+                key = tuple(pattern)
+                pattern_probabilities[key] = pattern_probabilities.get(key, 0.0) + count / len(patterns) / scale
+        result[f"RCMSE_{scale:02d}"] = (
+            float(-np.log(counts_next / counts_m)) if counts_m > 0 and counts_next > 0 else np.nan)
+        probs = np.array(list(pattern_probabilities.values()))
+        result[f"RCMPE_{scale:02d}"] = float(-np.sum(probs * np.log(probs)))
+    return result
+
+
 # --------------------------------------------------------------------------
 # Traitement d'un enregistrement (exécuté dans un processus fils)
 # --------------------------------------------------------------------------
 def process_subject(task):
     base, sid, group, label, sig, fs, canaux, p = task
-    sig = np.where(np.isfinite(sig), sig, 0.0)
-    sig = bandpass(sig, fs)
-    if p["notch"]:
-        sig = notch(sig, fs, p["notch"])
-    sig = reechantillonner(sig, fs)
+    if p.get("pretraite"):
+        if fs != FS_CIBLE or sig is None or sig.ndim != 2 or sig.shape[0] != len(canaux) or not np.isfinite(sig).all():
+            raise ValueError(f"{base}/{sid} : signal prétraité invalide ou fréquence incorrecte")
+    else:
+        sig = pretraiter(sig, fs, canaux, p["notch"])
     if p["duree_max"]:
         sig = sig[:, :int(round(p["duree_max"] * FS_CIBLE))]
     win, starts = make_windows(sig.shape[1], FS_CIBLE, p["fenetre"], p["chevauchement"])
@@ -274,6 +294,7 @@ def process_subject(task):
         seg = sig[:, s:s + win]
         for ch in range(seg.shape[0]):
             coefs = dwt_bands(seg[ch], FS_CIBLE, p["ondelette"])
+            multiscale = entropies_multiechelle(seg[ch]) if p.get("multiechelle") else {}
             if p["caracteristiques_etendues"]:
                 energies = np.array([np.sum(coef ** 2) for coef in coefs])
                 if not np.isfinite(energies).all():
@@ -287,16 +308,34 @@ def process_subject(task):
                     vals.update(mesures_etendues(coef))
                     vals["LogPower"] = float(np.log10(energies[j] + 1e-12))
                     vals["RelPower"] = float(energies[j] / total) if total > 0 else np.nan
+                if j == 0:
+                    vals.update(multiscale)
                 rows.append(dict(dataset=base, subject_id=sid, group_validation=group, label=label, window=w,
                                  channel=canaux[ch], band=band, **{AMPLITUDE: sd}, **vals))
     return sid, rows, len(starts)
 
 
 def run_dataset(base, args, p):
+    manifest = Path(args.donnees) / "controle_qualite.json"
+    if not manifest.is_file():
+        raise ValueError(f"Prétraitement 02 incomplet ou absent : {manifest}")
+    info = json.loads(manifest.read_text(encoding="utf-8"))
+    if (base not in info.get("bases", []) or info.get("pretraitement", {}).get("fs_cible") != FS_CIBLE
+            or info.get("pretraitement", {}).get("bandpass") != list(BANDPASS)):
+        raise ValueError(f"{base} : prétraitement 02 absent ou incompatible dans {manifest}")
+    p = {**p, "notch": info["pretraitement"].get("notch")}
     signaux, meta_all = charger_signaux(base, args.donnees, statut=None)
     keep = meta_all["statut"].eq("retenu")
     meta = meta_all.loc[keep].reset_index(drop=True)
     signaux = signaux_retenus = [s for s, k in zip(signaux, keep) if k]
+    if "signal_pretraite_sha256" not in meta:
+        raise ValueError(f"{base} : empreintes prétraitées absentes ; relancer 02.")
+    for (_, row), sig in zip(meta.iterrows(), signaux):
+        if sig is None:
+            raise ValueError(f"{base}/{row['subject_id']} : signal prétraité absent.")
+        fingerprint = hashlib.sha256(np.ascontiguousarray(sig, dtype=np.float64).tobytes()).hexdigest()
+        if fingerprint != row["signal_pretraite_sha256"]:
+            raise ValueError(f"{base}/{row['subject_id']} : empreinte prétraitée incohérente ; relancer 02.")
     canaux = canaux_sauvegardes(base, args.donnees)
     if args.limite:
         meta, signaux_retenus = meta.iloc[:args.limite], signaux[:args.limite]
@@ -322,6 +361,12 @@ def run_dataset(base, args, p):
 
     df = pd.DataFrame(all_rows)
     df.to_csv(out / "features_windows.csv", index=False)
+    if not df.empty:
+        feature_cols = MEASURES + MESURES_ETENDUES + PUISSANCES + MULTIECHELLE + [AMPLITUDE]
+        feature_cols = [col for col in feature_cols if col in df]
+        subjects = df.groupby(["dataset", "subject_id", "group_validation", "label", "channel", "band"],
+                              as_index=False)[feature_cols].mean()
+        subjects.to_csv(out / "features_sujets.csv", index=False)
     audit = meta_all.copy()
     audit["statut"] = audit["statut"].replace({"retenu": "extrait"})
     if args.limite:
@@ -340,10 +385,14 @@ def run_dataset(base, args, p):
         large.columns = [f"{c}_{b}_{m}" for m, c, b in large.columns]
         large.reset_index().to_csv(out / "features_large.csv", index=False)
     n_nan = df[measures].isna().sum().to_dict()
+    if p.get("multiechelle") and len(df):
+        n_nan.update(df.loc[df["band"].eq(BANDS[0]), MULTIECHELLE].isna().sum().to_dict())
     ecrire_json(out / "parametres_extraction.json", {
         "base": base, "canaux": canaux, "fs_cible": FS_CIBLE, "bandes": BANDS, "mesures": measures,
+        "mesures_multiechelle": MULTIECHELLE if p.get("multiechelle") else [],
         "puissances": "LogPower = log10(énergie DWT en µV² + 1e-12), RelPower = énergie / somme des 5 énergies",
-        "parametres": p, "enregistrements": int(audit["statut"].eq("extrait").sum()),
+        "parametres": p, "pretraitement_source": str(Path(args.donnees).resolve()),
+        "enregistrements": int(audit["statut"].eq("extrait").sum()),
         "fenetres": int(df.groupby("subject_id")["window"].nunique().sum()) if len(df) else 0,
         "valeurs_manquantes": n_nan, "duree_s": round(time.time() - t0, 1),
         "arguments": arguments_dict(args), "versions": versions(("numpy", "scipy", "pandas", "PyWavelets", "EntropyHub"))})
@@ -356,11 +405,11 @@ def run_dataset(base, args, p):
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("bases", nargs="*", help=f"parmi {BASES} (défaut : toutes)")
-    p.add_argument("--donnees", type=Path, default=None, help="Dossier de 01 (défaut sorties/01_donnees).")
+    p.add_argument("--donnees", type=Path, default=None, help="Dossier de prétraitement 02 (défaut : le plus récent complet).")
     p.add_argument("--fenetre", type=float, default=10.0, help="Durée des fenêtres en secondes.")
     p.add_argument("--chevauchement", type=float, default=0.0, help="Chevauchement entre 0 et <1.")
     p.add_argument("--duree-max", type=float, default=None, help="Ne garder que les N premières secondes.")
-    p.add_argument("--notch", type=float, default=None, help="Coupe-bande secteur (50 ou 60 Hz).")
+    p.add_argument("--notch", type=float, default=None, help="Obsolète : configurer le coupe-bande dans 02.")
     p.add_argument("--ondelette", default="db4")
     p.add_argument("--m", type=int, default=2, help="Dimension de plongement (SampEn, FuzzyEn, DispEn).")
     p.add_argument("--r", type=float, default=0.2, help="Tolérance (fraction de l'écart-type).")
@@ -368,7 +417,7 @@ def main():
     p.add_argument("--c-disp", type=int, default=6, help="Nombre de classes de DispEn.")
     p.add_argument("--entropyhub", action="store_true", help="Utiliser EntropyHub pour SampEn, FuzzyEn, DispEn.")
     p.add_argument("--caracteristiques-etendues", action="store_true",
-                   help="Ajouter ApEn, PermEn, Shannon amplitude et énergies DWT (EntropyHub requis).")
+                   help="Option conservée pour compatibilité : les caractéristiques sont toujours calculées.")
     p.add_argument("--large", action="store_true", help="Écrire aussi features_large.csv (une ligne par fenêtre).")
     p.add_argument("--limite", type=int, default=None, help="N premiers enregistrements seulement (essai).")
     p.add_argument("--workers", type=int, default=max(1, (os.cpu_count() or 2) - 1))
@@ -376,15 +425,20 @@ def main():
     bad = [b for b in args.bases if b not in BASES]
     if bad:
         p.error(f"base(s) inconnue(s) : {bad}")
-    if args.entropyhub or args.caracteristiques_etendues:
-        try:
-            import EntropyHub  # noqa: F401
-        except ModuleNotFoundError:
-            p.error("EntropyHub est requis pour --entropyhub ou --caracteristiques-etendues (pip install EntropyHub).")
+    if args.notch is not None:
+        p.error("Le coupe-bande se règle en 02 ; relancer 02 avec --notch.")
+    if args.donnees is None:
+        args.donnees = dernier_dossier("qc", contient="controle_qualite.json")
+    if args.donnees is None:
+        p.error("Aucun prétraitement 02 complet ; lancer 02_controle_qualite.py.")
+    try:
+        import EntropyHub  # noqa: F401
+    except ModuleNotFoundError:
+        p.error("EntropyHub est requis pour ApEn et PermEn (pip install EntropyHub).")
     params = dict(fenetre=args.fenetre, chevauchement=args.chevauchement, duree_max=args.duree_max,
                   notch=args.notch, ondelette=args.ondelette, m=args.m, r=args.r, n_fuzzy=args.n_fuzzy,
                   c_disp=args.c_disp, entropyhub=args.entropyhub,
-                  caracteristiques_etendues=args.caracteristiques_etendues, bandpass=list(BANDPASS))
+                  caracteristiques_etendues=True, multiechelle=True, pretraite=True, bandpass=list(BANDPASS))
     log(f"workers = {args.workers}")
     sorties = []
     for base in args.bases or BASES:

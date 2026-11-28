@@ -19,7 +19,7 @@ Points d'attention :
     (20 ou 22) est gardé : il est confondu avec le groupe (voir 02_controle_qualite.py).
   - Borisov et Sakib : l'ordre des électrodes est SUPPOSÉ (voir eeg_config.CANAUX).
   - Doublons : empreinte SHA-1 du signal ; le second fichier identique est exclu.
-  - Groupes de validation : 387-02w1 et 387-03w1 (schizophrénie) dans le même groupe.
+  - 387-02w1 est exclu par précaution ; 387-03w1 est conservé s'il est exploitable.
 
 Usage :
     python 01_chargement_donnees.py                       # les 3 bases
@@ -189,6 +189,16 @@ def marquer_doublons(meta):
     return meta
 
 
+def exclure_borisov_prudent(meta):
+    """Exclut 387-02w1, possiblement issu du même participant que 387-03w1."""
+    mask = meta["subject_id"].astype(str).str.contains("387-02w1", regex=False) & meta["statut"].eq("retenu")
+    meta.loc[mask, "statut"] = "exclu_doublon_potentiel"
+    meta.loc[mask, "remarque"] = "exclu par précaution ; possible lien avec 387-03w1"
+    if mask.any():
+        log(f"  ! {int(mask.sum())} enregistrement(s) 387-02w1 exclus par précaution.")
+    return meta
+
+
 def groupes_validation(base, ids):
     prudent = GROUPES_PRUDENTS.get(base, {})
     out = []
@@ -251,6 +261,8 @@ def main():
             log(f"  (rien à sauvegarder pour {base})")
             continue
         meta = pd.DataFrame(rows)
+        if base == "schizophrenie":
+            meta = exclure_borisov_prudent(meta)
         meta = marquer_doublons(meta)
         meta.insert(3, "group_validation", groupes_validation(base, meta["subject_id"]))
         meta.insert(0, "dataset", base)

@@ -21,8 +21,8 @@ Validation : StratifiedGroupKFold par sujet (387-02w1 / 387-03w1 dans le même g
 --repetitions fois avec des graines successives ; prétraitement ajusté dans chaque pli.
 Recherche aléatoire imbriquée groupée pour tous les modèles (sauf référence majoritaire).
 --sans-tuning désactive la recherche ; --profil-tuning quick permet un essai rapide.
---caracteristiques : classiques (défaut), etendues, ou etendues_puissances.
-Les deux derniers choix exigent une extraction 03 avec --caracteristiques-etendues.
+--caracteristiques : classiques, etendues, ou etendues_puissances (défaut).
+Les jeux étendus exigent les caractéristiques correspondantes dans l'extraction 03.
 
 Usage :
     python 05_classification_binaire.py
@@ -43,7 +43,7 @@ import pandas as pd
 from sklearn.metrics import confusion_matrix
 
 from eeg_config import BANDS, BASES, CLASSES_BINAIRES, GRAINE, MEASURES, MESURES_ETENDUES, NOM_TROUBLE, PUISSANCES
-from eeg_donnees import (agreger, ajouter_arguments_extraction, charger_extraction, dossier_extraction_defaut,
+from eeg_donnees import (agreger, agreger_multiechelle, ajouter_arguments_extraction, charger_extraction, dossier_extraction_defaut,
                          lire_carte_canaux)
 from eeg_utils import (Compteur, arguments_dict, ecrire_json, entete, fmt_table, log,
                        make_folds, multiclass_scores, nouveau_dossier, p_valeur_permutation,
@@ -91,6 +91,8 @@ def preparer_base(base, run, args, orders):
     if args.caracteristiques == "etendues_puissances":
         mesures += PUISSANCES
     ent, amp = agreger(info, canaux, mesures)
+    if args.caracteristiques != "classiques":
+        ent = pd.concat([ent, agreger_multiechelle(info, canaux)], axis=1)
     inputs = {"entropies": ent}
     if not args.sans_reference_amplitude:
         inputs["amplitude"] = amp
@@ -146,7 +148,8 @@ def analyser_base(base, run, args, orders, collect):
         cols = pd.Series(ent.columns)
         mesures = list(dict.fromkeys(c.rsplit("|", 1)[-1] for c in ent.columns))
         groupes_var = {f"mesure={m}": cols.str.endswith("|" + m) for m in mesures}
-        groupes_var.update({f"bande={b}": cols.str.contains(f"|{b}|", regex=False) for b in BANDS})
+        bandes = list(dict.fromkeys(c.split("|")[1] for c in ent.columns))
+        groupes_var.update({f"bande={b}": cols.str.contains(f"|{b}|", regex=False) for b in bandes})
         groupes_var.update({f"sans_mesure={m}": ~cols.str.endswith("|" + m) for m in mesures})
         for nom_g, mask in groupes_var.items():
             x = ent.loc[:, mask.to_numpy()].to_numpy(float)
@@ -207,7 +210,8 @@ def main():
                    help="Dépression : garder les fichiers d'origine à ce nombre de canaux (20 ou 22).")
     p.add_argument("--modeles", nargs="+", choices=MODELES, default=DEFAUT)
     p.add_argument("--caracteristiques", choices=["classiques", "etendues", "etendues_puissances"],
-                   default="classiques", help="Jeu de variables ; les jeux étendus exigent l'option correspondante en 03.")
+                   default="etendues_puissances",
+                   help="Jeu de variables (défaut : entropies étendues, multiéchelles et puissances).")
     p.add_argument("--sans-reference-amplitude", action="store_true")
     p.add_argument("--plis", type=int, default=5)
     p.add_argument("--repetitions", type=int, default=10)

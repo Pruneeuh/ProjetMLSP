@@ -91,6 +91,7 @@ GROUPES_PRUDENTS = {
 MEASURES = ["SampEn", "DispEn", "FuzzyEn", "Shannon_spectrale", "LZC"]
 MESURES_ETENDUES = ["ApEn", "PermEn", "Shannon_amplitude"]
 PUISSANCES = ["LogPower", "RelPower"]
+MULTIECHELLE = [f"{name}_{scale:02d}" for name in ("RCMSE", "RCMPE") for scale in range(1, 11)]
 # DWT db4 niveau 4 à 128 Hz : pywt.wavedec renvoie [A4, D4, D3, D2, D1].
 BANDS = ["A4", "D4", "D3", "D2", "D1"]
 BANDES_HZ = {"A4": "0-4 Hz (delta)", "D4": "4-8 Hz (thêta)", "D3": "8-16 Hz (alpha)",

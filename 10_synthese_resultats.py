@@ -10,6 +10,9 @@ Sortie  : sorties/10_synthese/<date>/
                            probabilités moyennées sur les répétitions)
     comparaisons.csv       différence d'exactitude équilibrée avec la régression logistique de la
                            même tâche (IC 95 % bootstrap apparié, part des tirages > 0)
+    metriques_par_classe.csv précision, rappel, spécificité, F1 et IC bootstrap du rappel
+    shap_principales.csv   dix variables SHAP les plus importantes par tâche et classe (si disponibles)
+    ablation.csv           résultats d'ablation de l'étape 05 (si disponibles)
     synthese.md, synthese.tex   tableaux prêts à copier dans le rapport
     calibration_<tâche>.png     diagrammes de fiabilité (tâches binaires)
     synthese_exactitude.png     meilleurs modèles par tâche avec IC 95 %
@@ -101,11 +104,19 @@ def bootstrap_multi(y, pr, labels, groupes, n_boot, seed, cles):
             for k, v in vals.items()}
 
 
+def rappel_classe(y, proba, classe):
+    mask = y == classe
+    return float(np.mean(proba.argmax(axis=1)[mask] == classe)) if mask.any() else np.nan
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--binaire", type=Path, default=None)
     p.add_argument("--multiclasse", type=Path, default=None)
-    p.add_argument("--profond", type=Path, default=None)
+    profond = p.add_mutually_exclusive_group()
+    profond.add_argument("--profond", type=Path, default=None)
+    profond.add_argument("--sans-profond", action="store_true", help="Ne pas inclure les résultats de l'étape 07.")
+    p.add_argument("--interpretabilite", type=Path, default=None)
     p.add_argument("--bootstrap", type=int, default=1000)
     p.add_argument("--graine", type=int, default=GRAINE)
     p.add_argument("--reference", default="regression_logistique", help="Modèle de comparaison.")
@@ -113,7 +124,7 @@ def main():
     dossiers = {
         "binaire": args.binaire or dernier_dossier("binaire", contient="predictions_hors_pli.csv"),
         "multiclasse": args.multiclasse or dernier_dossier("multiclasse", contient="predictions_hors_pli.csv"),
-        "profond": args.profond or dernier_dossier("profond", contient="predictions_hors_pli.csv"),
+        "profond": None if args.sans_profond else args.profond or dernier_dossier("profond", contient="predictions_hors_pli.csv"),
     }
     entete("SYNTHÈSE DES RÉSULTATS")
     frames = []
@@ -129,7 +140,29 @@ def main():
     if not frames:
         p.exit(1, "Aucun fichier de prédictions trouvé.\n")
     out = nouveau_dossier("synthese")
-    rows, comps, figures = [], [], []
+    notes = []
+    if dossiers["binaire"] is not None:
+        path_ablation = Path(dossiers["binaire"]) / "ablation.csv"
+        if path_ablation.is_file():
+            pd.read_csv(path_ablation).to_csv(out / "ablation.csv", index=False)
+            notes.append("Ablations binaires : voir ablation.csv.")
+        else:
+            log("  Ablations binaires absentes de la source 05.")
+    interpretation = args.interpretabilite or dernier_dossier("interpretabilite", contient="shap_valeurs.csv")
+    if interpretation is not None:
+        path_shap = Path(interpretation) / "shap_valeurs.csv"
+        if not path_shap.is_file():
+            p.exit(1, f"Fichier SHAP introuvable : {path_shap}\n")
+        shap = pd.read_csv(path_shap)
+        needed = {"tache", "classe", "variable", "shap_abs_moyen"}
+        if not needed <= set(shap.columns):
+            p.exit(1, f"Colonnes SHAP manquantes : {sorted(needed - set(shap.columns))}\n")
+        shap.sort_values("shap_abs_moyen", ascending=False).groupby(
+            ["tache", "classe"], sort=False).head(10).to_csv(out / "shap_principales.csv", index=False)
+        notes.append(f"Principales variables SHAP hors pli : voir shap_principales.csv (source : {interpretation}).")
+    else:
+        log("  SHAP absent : lancer 09 avec --shap.")
+    rows, comps, figures, classes_rows = [], [], [], []
     oof = {}
     for df in frames:
         for (tache, harm, modele), g in df.groupby(["tache", "harmonisation", "modele"], sort=False):
@@ -144,6 +177,22 @@ def main():
             auc_key = "auc" if len(labels) == 2 else "auc_ovr_macro"
             ic = bootstrap_multi(y, pr, labels, grp, args.bootstrap, args.graine,
                                  ["exactitude_equilibree", auc_key, "brier"])
+            pred = pr.argmax(axis=1)
+            for c in labels:
+                rappel = rappel_classe(y, pr, c)
+                lo, hi = bootstrap_ic(lambda idx: rappel_classe(y[idx], pr[idx], c),
+                                      len(y), grp, args.bootstrap, args.graine)
+                tp = int(np.sum((y == c) & (pred == c)))
+                fp = int(np.sum((y != c) & (pred == c)))
+                tn = int(np.sum((y != c) & (pred != c)))
+                fn = int(np.sum((y == c) & (pred != c)))
+                classes_rows.append(dict(source=g["source"].iloc[0], tache=tache, harmonisation=harm,
+                                         modele=modele, classe=(CLASSES if len(labels) == 4 else CLASSES_BINAIRES)[c],
+                                         effectif=int(np.sum(y == c)), rappel=rappel,
+                                         ic95_rappel_bas=lo, ic95_rappel_haut=hi,
+                                         precision=tp / (tp + fp) if tp + fp else np.nan,
+                                         specificite=tn / (tn + fp) if tn + fp else np.nan,
+                                         f1=2 * tp / (2 * tp + fp + fn) if 2 * tp + fp + fn else np.nan))
             rows.append(dict(source=g["source"].iloc[0], tache=tache, harmonisation=harm, modele=modele,
                              n_sujets=len(y), n_repetitions=int(g["repetition"].nunique()),
                              exactitude_equilibree=per_rep["exactitude_equilibree"].mean(),
@@ -159,6 +208,7 @@ def main():
     hasard = {t: (0.25 if t == "multiclasse" else 0.5) for t in syn["tache"]}
     syn["hasard"] = syn["tache"].map(hasard)
     syn.to_csv(out / "synthese.csv", index=False)
+    pd.DataFrame(classes_rows).to_csv(out / "metriques_par_classe.csv", index=False)
 
     # Comparaison appariée avec la référence (mêmes sujets, mêmes plis dans une même source)
     rng_seed = args.graine
@@ -198,7 +248,14 @@ def main():
                for r in table.itertuples(index=False)]
     (out / "synthese.md").write_text(
         "# Synthèse des résultats\n\nMoyenne ± écart-type sur les répétitions ; IC 95 % bootstrap par sujet "
-        "(probabilités moyennées sur les répétitions).\n\n" + "\n".join(lignes) + "\n", encoding="utf-8")
+        "(probabilités moyennées sur les répétitions). Les métriques par classe et leurs IC de rappel "
+        "sont dans metriques_par_classe.csv. Les IC conditionnent sur les prédictions hors pli disponibles "
+        "et ne comprennent pas toute l'incertitude d'entraînement ou de sélection du modèle.\n\n"
+        "La base et le trouble sont confondus en multiclasse : l'harmonisation ne démontre pas une "
+        "généralisation clinique. Les étiquettes d'anxiété proviennent du dépistage GAD-7. "
+        "Les explications SHAP décrivent le modèle et ne démontrent pas de causalité.\n\n" +
+        "\n".join(notes) + "\n\n" +
+        "\n".join(lignes) + "\n", encoding="utf-8")
     try:
         tex = table.to_latex(index=False, float_format="%.3f", escape=True,
                              caption="Performances hors pli (moyenne $\\pm$ écart-type ; IC 95~\\% bootstrap par sujet).",

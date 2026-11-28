@@ -1,21 +1,47 @@
 # Pipeline modulaire : entropies EEG et santé mentale (IFT-7030)
 
-Scripts numérotés, à lancer dans l'ordre depuis ce dossier. Chaque étape lit par défaut
-la sortie **la plus récente** de l'étape précédente dans `sorties/` ; toutes acceptent `--help`.
+Scripts numérotés, à lancer dans l'ordre depuis ce dossier. Exécutée seule, chaque étape lit
+par défaut la sortie **la plus récente** de l'étape précédente dans `sorties/` ; toutes acceptent `--help`.
 
 | Étape | Script | Rôle | Sortie principale |
 |---|---|---|---|
-| 00 | `00_pipeline.py` | lance tout (ou `--etapes 4 5 6`), `--rapide` pour un essai | `sorties/journal_pipeline_*/` |
+| 00 | `00_pipeline.py` | lance 01–06 et 08–10 (ou `--etapes 4 5 6`), `--rapide` pour un essai | `sorties/journal_pipeline_*/` |
 | 01 | `01_chargement_donnees.py` | lecture EDF / .eea / .mat, µV, doublons (SHA), groupes de validation | `sorties/01_donnees/` |
-| 02 | `02_controle_qualite.py` | durées, NaN, canaux plats/saturés, bruit secteur, DSP, **confusions d'acquisition** | `sorties/02_controle_qualite/` |
-| 03 | `03_extraction_entropies.py` | filtre 0,5-45 Hz, 128 Hz, fenêtres 10 s, DWT db4 (A4…D1), SampEn, DispEn, FuzzyEn, Shannon spectrale, LZC (multiprocessus) | `sorties/03_extraction/<base>_*/features_windows.csv` |
+| 02 | `02_controle_qualite.py` | contrôle des signaux, filtrage 0,5–45 Hz, rééchantillonnage à 128 Hz et confusions d'acquisition | `sorties/02_controle_qualite/<date>/` |
+| 03 | `03_extraction_entropies.py` | fenêtres 10 s, DWT, entropies et énergies, RCMSE/RCMPE large bande | `sorties/03_extraction/<base>_*/features_windows.csv` |
 | 04 | `04_fusion_harmonisation.py` | 10 canaux communs, 4 classes, diagnostic de l'effet de site (η², ACP) | `sorties/04_fusion/` |
 | 05 | `05_classification_binaire.py` | trouble / témoins par base : RL, MLP, SVM, kNN, forêt, LDA, XGBoost, LightGBM, références et recherche imbriquée | `sorties/05_binaire/` |
-| 06 | `06_classification_multiclasse.py` | 4 classes × 4 harmonisations dans les plis, contrôles de site (a)/(b), permutations globale et intra-base, leave-one-dataset-out | `sorties/06_multiclasse/` |
+| 06 | `06_classification_multiclasse.py` | 4 classes × 4 harmonisations dans les plis, contrôles de site, permutations facultatives, leave-one-dataset-out | `sorties/06_multiclasse/` |
 | 07 | `07_reseaux_neurones.py` | CNN 1D, CNN+attention, EEGNet adapté, FT-Transformer, TabM (binaire et 4 classes) | `sorties/07_reseaux_neurones/` |
 | 08 | `08_statistiques_groupes.py` | Mann-Whitney + FDR, δ de Cliff, g de Hedges, similarité des signatures entre troubles | `sorties/08_statistiques/` |
-| 09 | `09_interpretabilite.py` | importance par permutation de groupes (mesure, bande, électrode), coefficients RL, SHAP optionnel | `sorties/09_interpretabilite/` |
-| 10 | `10_synthese_resultats.py` | IC 95 % bootstrap par sujet, Brier, calibration, comparaisons appariées, tableaux Markdown / LaTeX | `sorties/10_synthese/` |
+| 09 | `09_interpretabilite.py` | importance par permutation de groupes, coefficients RL, SHAP sur les sujets hors pli | `sorties/09_interpretabilite/` |
+| 10 | `10_synthese_resultats.py` | IC 95 %, métriques par classe, Brier, calibration et comparaisons appariées | `sorties/10_synthese/` |
+
+L'étape 01 exclut `387-02w1` par précaution et conserve `387-03w1` lorsqu'il est
+exploitable ; l'exclusion est consignée dans les métadonnées. L'étape 02 signale les
+problèmes de qualité et confusions possibles mais ne confirme pas l'ordre des électrodes
+supposé ni ne retire automatiquement les signaux. Un signal non fini, absent, incompatible
+avec les canaux ou trop court pour le filtre arrête l'étape 02 ; l'étape 03 ne remplace plus
+les valeurs non finies par zéro. Une alerte d'amplitude élevée n'est pas une preuve de
+saturation physique. Les unités Borisov et Sakib et l'ordre de leurs canaux restent supposés.
+
+Le lanceur réutilise automatiquement les sorties 01–04 qu'il a précédemment produites si les
+empreintes SHA-256 des entrées et des sorties, le code, les paramètres et les versions Python
+et des paquets correspondent. Il transmet les dossiers réutilisés aux étapes suivantes. Les
+anciennes sorties sans preuve de provenance ne sont pas réutilisées automatiquement. Les données
+source doivent rester disponibles pour vérifier l'étape 01. `--recalculer` force l'exécution
+de 01–04 ; les étapes 05–10 ne sont pas mises en cache. Si 01–04 échoue, le lanceur s'arrête,
+même avec `--continuer`, pour éviter d'utiliser des résultats périmés.
+
+L'étape 02 écrit les signaux prétraités dans un nouveau dossier et termine par un manifeste
+`controle_qualite.json`. L'étape 03 lit ce dossier sans filtrer une deuxième fois et refuse
+un dossier incomplet ou incompatible. Les empreintes SHA-256 des signaux source et
+prétraités sont contrôlées respectivement en 02 et en 03. Le lanceur transmet explicitement le dossier produit
+par 02 à 03. Pour exécuter les étapes
+séparément, lancer 02 avant 03 ; `03 --donnees` désigne désormais le dossier de 02.
+Le coupe-bande secteur, si nécessaire, se règle en 02 avec `--notch 50` ou `--notch 60` ;
+il reste désactivé par défaut. Les paramètres sont fixes et appliqués à chaque enregistrement,
+sans apprentissage inter-sujets ; il ne s'agit pas d'une correction garantie des effets de site.
 
 Modules partagés (non exécutables ; un module Python ne peut pas commencer par un chiffre) :
 
@@ -48,7 +74,9 @@ observées dans le notebook Valeria. La disponibilité des wheels et de leurs d�
 peut varier selon les modules ; en cas d'échec, consulter `avail_wheels` ou le support Valeria.
 Aucun téléchargement PyPI ni installation RAPIDS n'est tenté automatiquement.
 Cette installation est à effectuer une seule fois : le lanceur `00_pipeline.py` exécute ensuite
-les étapes 01 à 10 dans l'environnement activé, sans réinstaller les paquets.
+les étapes 01 à 06 et 08 à 10 dans l'environnement activé, sans réinstaller les paquets.
+L'étape 07 reste accessible explicitement via `--etapes 7 10` ou directement. La synthèse
+du lanceur exclut les anciens résultats 07 lorsqu'elle n'a pas été exécutée avec succès.
 
 Pour Jupyter, après activation, enregistrer un noyau avec un nom qui n'existe pas déjà :
 
@@ -81,26 +109,44 @@ Essai sans les vraies données : `python outils/generer_donnees_test.py` puis
 
 ## Réutiliser les extractions existantes
 
-Les étapes 04 à 09 acceptent les anciens dossiers `extraction_corrigee.py` (même format,
-colonnes `col01…` converties avec l'ordre supposé) :
+Les anciennes extractions `extraction_corrigee.py` peuvent manquer les caractéristiques
+étendues et multiéchelles. Dans ce cas, sélectionner explicitement le mode classique
+(colonnes `col01…` converties avec l'ordre supposé) :
 
 ```bash
-python 04_fusion_harmonisation.py --depression 04_extraction_corrigee/depression_20261122_185618_080052 \
+python 04_fusion_harmonisation.py --sans-caracteristiques-etendues \
+    --depression 04_extraction_corrigee/depression_20261122_185618_080052 \
     --schizophrenie 04_extraction_corrigee/schizophrenie_20261123_193938_456160 \
     --anxiete 04_extraction_corrigee/anxiete_20261123_215357_170531
-python 05_classification_binaire.py --depression ... --schizophrenie ... --anxiete ...
-python 06_classification_multiclasse.py        # lit la fusion la plus récente
+python 05_classification_binaire.py --caracteristiques classiques --depression ... --schizophrenie ... --anxiete ...
+python 06_classification_multiclasse.py --caracteristiques classiques
 ```
 
-## Comparaison des caractéristiques étendues
+## Caractéristiques et comparaisons
 
-Par défaut, les étapes 03 à 06 conservent leurs caractéristiques classiques.
-Pour ajouter ApEn, PermEn, Shannon de l'histogramme d'amplitude et les énergies DWT :
+L'étape 03 calcule toujours ApEn, PermEn, Shannon d'amplitude, les énergies DWT et
+RCMSE/RCMPE par canal sur le signal filtré, aux échelles 1 à 10. Les fenêtres sont
+agrégées par participant ; `features_sujets.csv` contient leur moyenne. RCMSE utilise
+m=2 et r=0,15 écart-type du signal de la fenêtre ; RCMPE utilise m=4 et le logarithme
+naturel. Les mesures large bande figurent uniquement sur les lignes A4 du fichier long,
+mais ne sont **pas** des caractéristiques A4 ; la fusion les étiquette `large_bande`.
+Les valeurs indéfinies restent manquantes et l'imputation est ajustée dans les plis.
+
+Par défaut, 04 fusionne les caractéristiques étendues, multiéchelles et les énergies ; 05,
+06 et 09 utilisent ce jeu combiné même lorsqu'ils sont lancés séparément. Le lanceur
+transmet aussi explicitement ces options,
+active l'ablation en 05 et SHAP hors pli en 09 (régression logistique réglée par défaut).
+Les tests de permutation restent désactivés ; l'importance par permutation de variables en
+09 est une analyse différente. Ces calculs peuvent être très longs, même en mode rapide.
+L'étape 07 conserve son tenseur des cinq mesures classiques.
+
+Pour exécuter les étapes séparément :
 
 ```bash
 pip install EntropyHub
-python 03_extraction_entropies.py --caracteristiques-etendues
-python 04_fusion_harmonisation.py --caracteristiques-etendues
+python 02_controle_qualite.py
+python 03_extraction_entropies.py
+python 04_fusion_harmonisation.py
 python 05_classification_binaire.py --caracteristiques etendues
 python 05_classification_binaire.py --caracteristiques etendues_puissances
 python 06_classification_multiclasse.py --caracteristiques etendues
@@ -110,9 +156,12 @@ python 06_classification_multiclasse.py --caracteristiques etendues_puissances
 Utiliser les mêmes dossiers d'extraction/fusion, modèles, plis, répétitions et graines dans les
 deux exécutions pour comparer les caractéristiques sur les mêmes partitions ; choisir les
 dossiers explicitement avec `--depression`, `--schizophrenie`, `--anxiete` et `--fusion` si
-nécessaire. `etendues` ajoute les trois mesures aux cinq mesures classiques ;
+nécessaire. `etendues` ajoute les trois mesures et les entropies multiéchelles aux cinq mesures classiques ;
 `etendues_puissances` ajoute en plus LogPower et RelPower. Les anciens dossiers restent
 utilisables en mode `classiques` ; les options étendues exigent de nouvelles extractions.
+Dans certains résultats, l'étiquette historique `entropies` désigne le jeu sélectionné :
+avec le réglage par défaut, il contient aussi les puissances. La référence d'amplitude est
+un modèle distinct.
 
 Les étapes 05 et 06 continuent à moyenner les caractéristiques par participant avant
 l'entraînement : elles ne reproduisent pas l'entraînement par fenêtre du notebook. Le

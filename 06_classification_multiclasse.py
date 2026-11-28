@@ -320,7 +320,8 @@ def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--fusion", type=Path, default=None, help="Dossier de 04_fusion (défaut : le plus récent).")
     p.add_argument("--caracteristiques", choices=["classiques", "etendues", "etendues_puissances"],
-                   default="classiques", help="Jeu de variables ; les jeux étendus exigent l'option correspondante en 04.")
+                   default="etendues_puissances",
+                   help="Jeu de variables (défaut : entropies étendues, multiéchelles et puissances de 04).")
     p.add_argument("--harmonisations", nargs="+", choices=eh.HARMONISATIONS, default=eh.HARMONISATIONS)
     modeles = ["regression_logistique", "mlp", "svm", "svm_rbf", "knn",
                "foret_aleatoire", "lda", "xgboost", "lightgbm"]

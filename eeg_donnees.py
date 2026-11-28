@@ -14,7 +14,7 @@ import numpy as np
 import pandas as pd
 
 from eeg_config import (ALIASES, AMPLITUDE, BANDS, BASES, CANAUX, CLASS_OF_BASE, DOSSIERS, MEASURES,
-                        MESURES_ETENDUES, ORDRE_PREFERE, PUISSANCES, SORTIES)
+                        MESURES_ETENDUES, MULTIECHELLE, ORDRE_PREFERE, PUISSANCES, SORTIES)
 from eeg_utils import dernier_dossier, require
 
 
@@ -100,7 +100,7 @@ def charger_extraction(run, expected, orders=None, aggregation="moyenne"):
     original = sorted(sets.iloc[0], key=str)
     mapping = channel_map(expected, original, orders)
     data["canal"] = data["channel"].map(mapping)
-    for col in MEASURES + [AMPLITUDE] + [c for c in MESURES_ETENDUES + PUISSANCES if c in data]:
+    for col in MEASURES + [AMPLITUDE] + [c for c in MESURES_ETENDUES + PUISSANCES + MULTIECHELLE if c in data]:
         data[col] = pd.to_numeric(data[col], errors="raise").replace([np.inf, -np.inf], np.nan)
     data["log_sd"] = np.log(data[AMPLITUDE].where(data[AMPLITUDE] > 0))
     canaux = sorted(set(mapping.values()), key=lambda c: ORDRE_PREFERE.index(c) if c in ORDRE_PREFERE else 99)
@@ -129,6 +129,21 @@ def agreger(info, canaux, mesures=None):
     amp = amp.reindex(info["records"].index)
     amp.columns = ["log_sd|" + "|".join(c) for c in amp.columns]
     return ent, amp
+
+
+def agreger_multiechelle(info, canaux):
+    """Agrège les caractéristiques large bande par sujet et canal, sans répéter les bandes DWT."""
+    data = info["data"]
+    missing = set(MULTIECHELLE) - set(data.columns)
+    require(not missing, f"{info['base']} : entropies multiéchelles absentes ; relancer 03.")
+    data = data.loc[data["canal"].isin(canaux) & data["band"].eq(BANDS[0])]
+    how = "mean" if info["aggregation"] == "moyenne" else "median"
+    ent = data.groupby(["subject_id", "canal"])[MULTIECHELLE].agg(how).unstack("canal")
+    ent = ent.reorder_levels([1, 0], axis=1)
+    ent = ent.reindex(columns=pd.MultiIndex.from_product([canaux, MULTIECHELLE]))
+    ent = ent.reindex(info["records"].index)
+    ent.columns = [f"{c}|large_bande|{m}" for c, m in ent.columns]
+    return ent
 
 
 def lire_carte_canaux(path):
@@ -230,6 +245,14 @@ def caracteristiques_fusion(common, ent, meta, dossier, choix):
                 f"{path} : colonnes de caractéristiques incohérentes avec la fusion.")
         extra = extra[columns].apply(pd.to_numeric, errors="raise")
         ent = pd.concat([ent, extra.reindex(meta.index)], axis=1)
+    path = dossier / "entropies_multiechelle_sujets.csv"
+    require(path.is_file(), f"{path} absent ; relancer 03 et 04.")
+    extra = pd.read_csv(path, index_col="subject_id")
+    columns = [f"{c}|large_bande|{m}" for c in common for m in MULTIECHELLE]
+    require(extra.index.is_unique and set(extra.index) == set(meta.index)
+            and extra.columns.is_unique and set(extra.columns) == set(columns),
+            f"{path} : sujets ou colonnes incohérents avec la fusion.")
+    ent = pd.concat([ent, extra[columns].apply(pd.to_numeric, errors="raise").reindex(meta.index)], axis=1)
     return ent
 
 

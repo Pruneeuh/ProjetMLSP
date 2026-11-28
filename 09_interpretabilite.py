@@ -33,7 +33,7 @@ import pandas as pd
 
 import eeg_harmonisation as eh
 from eeg_config import BANDS, BASES, CLASSES, GRAINE, MEASURES, MESURES_ETENDUES, PUISSANCES
-from eeg_donnees import (agreger, caracteristiques_fusion, charger_extraction, charger_fusion,
+from eeg_donnees import (agreger, agreger_multiechelle, caracteristiques_fusion, charger_extraction, charger_fusion,
                          decomposer_colonnes, dossier_extraction_defaut, lire_carte_canaux)
 from eeg_utils import (arguments_dict, ecrire_json, entete, log, make_folds, multiclass_scores,
                        nouveau_dossier, plt_agg, require, versions)
@@ -70,6 +70,8 @@ def donnees_tache(tache, args, orders):
     if args.caracteristiques == "etendues_puissances":
         mesures += PUISSANCES
     ent, _ = agreger(info, canaux, mesures)
+    if args.caracteristiques != "classiques":
+        ent = pd.concat([ent, agreger_multiechelle(info, canaux)], axis=1)
     y = rec["label"].astype(int).to_numpy()
     return ent, y, rec["group_validation"].astype(str).to_numpy(), None, y, "aucune", [0, 1]
 
@@ -79,7 +81,7 @@ def groupes_variables(colonnes):
     g = {}
     for m in dict.fromkeys(d["mesure"]):
         g[("mesure", m)] = np.flatnonzero(d["mesure"].eq(m).to_numpy())
-    for b in BANDS:
+    for b in dict.fromkeys(d["bande"]):
         g[("bande", b)] = np.flatnonzero(d["bande"].eq(b).to_numpy())
     for c in dict.fromkeys(d["canal"]):
         g[("electrode", c)] = np.flatnonzero(d["canal"].eq(c).to_numpy())
@@ -242,7 +244,7 @@ def main():
                                         "foret_aleatoire", "lda", "xgboost", "lightgbm"],
                    default="regression_logistique")
     p.add_argument("--caracteristiques", choices=["classiques", "etendues", "etendues_puissances"],
-                   default="classiques")
+                   default="etendues_puissances")
     p.add_argument("--sans-tuning", action="store_true", help="Désactiver la recherche imbriquée.")
     p.add_argument("--profil-tuning", choices=["quick", "comprehensive"], default="comprehensive")
     p.add_argument("--plis-internes", type=int, default=None)
