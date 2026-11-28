@@ -215,7 +215,7 @@ def main():
                    help="Jeu de variables (défaut : entropies étendues, multiéchelles et puissances).")
     p.add_argument("--sans-reference-amplitude", action="store_true")
     p.add_argument("--plis", type=int, default=5)
-    p.add_argument("--repetitions", type=int, default=10)
+    p.add_argument("--repetitions", type=int, default=3, help="Nombre de répétitions (défaut : 3).")
     p.add_argument("--graine", type=int, default=GRAINE)
     p.add_argument("--c", type=float, default=1.0, help="C de la régression logistique avec --sans-tuning.")
     p.add_argument("--mlp-couches", type=int, nargs="+", default=[16])

@@ -211,8 +211,9 @@ Les valeurs indéfinies restent manquantes et l'imputation est ajustée dans les
 
 Par défaut, 04 fusionne les caractéristiques étendues, multiéchelles et les énergies ; 05,
 06 et 09 utilisent ce jeu combiné même lorsqu'ils sont lancés séparément. Le lanceur
-transmet aussi explicitement ces options,
-active l'ablation en 05 et SHAP hors pli en 09 (régression logistique réglée par défaut).
+transmet aussi explicitement ces options et active SHAP hors pli en 09
+(régression logistique réglée par défaut). L'ablation en 05 n'est pas activée par le
+lanceur ; elle reste disponible en lançant `05_classification_binaire.py --ablation` directement.
 Les tests de permutation restent désactivés ; l'importance par permutation de variables en
 09 est une analyse différente. Ces calculs peuvent être très longs, même en mode rapide.
 L'étape 07 conserve son tenseur des cinq mesures classiques.
@@ -244,6 +245,8 @@ environ 80 % des groupes pour l'entraînement et 20 % pour le test (les effectif
 modifier légèrement le rapport). Tous les enregistrements et fenêtres d'un groupe restent ensemble.
 05 utilise les canaux de chaque base, 06 les canaux communs ; les deux entraînent sur les fenêtres
 train et calculent les métriques sur les probabilités test moyennées par participant.
+05 et 06 utilisent trois répétitions par défaut, modifiables avec `--repetitions` en lançant
+chaque étape directement. Le mode rapide du lanceur en utilise une.
 Les répétitions réajustent les modèles avec des graines différentes sur **le même test** : leur
 écart-type n'est pas une variabilité entre partitions. Ablations, contrôles de site, permutations
 et LODO utilisent uniquement train. 04 conserve des matrices par sujet pour les analyses descriptives

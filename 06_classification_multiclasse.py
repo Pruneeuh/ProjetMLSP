@@ -360,7 +360,7 @@ def main():
     p.add_argument("--filtrage-fraction", type=float, default=0.5)
     p.add_argument("--filtrage-arbres", type=int, default=200)
     p.add_argument("--plis", type=int, default=5)
-    p.add_argument("--repetitions", type=int, default=10)
+    p.add_argument("--repetitions", type=int, default=3, help="Nombre de répétitions (défaut : 3).")
     p.add_argument("--permutations", type=int, default=0,
                    help="Nombre de permutations ; chacune répète la recherche imbriquée.")
     p.add_argument("--permutation-modeles", nargs="+", default=["regression_logistique"],

@@ -155,7 +155,7 @@ class ExtendedFeatureTests(unittest.TestCase):
         self.assertEqual(by_step["02"][by_step["02"].index("--sortie") + 1],
                          by_step["03"][by_step["03"].index("--donnees") + 1])
         self.assertIn("--caracteristiques-etendues", by_step["04"])
-        self.assertIn("--ablation", by_step["05"])
+        self.assertNotIn("--ablation", by_step["05"])
         self.assertIn("--shap", by_step["09"])
         for step in ("05", "06", "09"):
             self.assertIn("etendues_puissances", by_step[step])

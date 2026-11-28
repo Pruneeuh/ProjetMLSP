@@ -54,7 +54,7 @@ RAPIDE = {
 }
 OPTIONS_ANALYSE = {
     4: ["--caracteristiques-etendues"],
-    5: ["--caracteristiques", "etendues_puissances", "--ablation", "--rapids"],
+    5: ["--caracteristiques", "etendues_puissances", "--rapids"],
     6: ["--caracteristiques", "etendues_puissances", "--rapids"],
     9: ["--caracteristiques", "etendues_puissances", "--shap", "--rapids"],
 }
