@@ -55,24 +55,53 @@ Modules partagés (non exécutables ; un module Python ne peut pas commencer par
 
 ### Valeria : environnement isolé
 
-Avec les mêmes modules que ceux utilisés lors de la création de l'environnement :
+`requirement.txt` décrit les versions principales de l'environnement Python 3.12 observé
+sur Valeria. Les versions publiques épinglées acceptent aussi les wheels locales
+`+computecanada`. Les dépendances transitives ne sont pas toutes épinglées : ce fichier
+n'est pas un verrouillage complet. Les wheels Valeria et les modules chargés restent
+nécessaires ; ces versions ne sont pas garanties sur PyPI ou d'autres plateformes.
+
+Pour un nouvel environnement seulement, après chargement des modules, créer le dossier
+uniquement s'il n'existe pas déjà :
 
 ```bash
 module load StdEnv/2023 python/3.12.4 scipy-stack/2024a
-python 00_package_installs.py
+python -m venv ~/venvs/projetmlsp-valeria
+```
+
+À chaque session, y compris si l'environnement existe déjà :
+
+```bash
+module load StdEnv/2023 python/3.12.4 scipy-stack/2024a
+module load cuda/12.6
 source ~/venvs/projetmlsp-valeria/bin/activate
 unset PYTHONPATH PYTHONHOME
 export PYTHONNOUSERSITE=1
 ```
 
-Le script crée un nouvel environnement sous `~/venvs/projetmlsp-valeria`, installe les
-paquets depuis la wheelhouse Valeria avec `--no-index`, puis vérifie les imports, les
-dépendances et un petit entraînement CPU avec explication SHAP/XGBoost. Il refuse de modifier
-un chemin existant ; utiliser `--env ~/venvs/un-autre-nom` pour un nouvel emplacement. Les
-versions NumPy, SciPy, Matplotlib, SHAP, XGBoost et scikit-learn correspondent à celles
-observées dans le notebook Valeria. La disponibilité des wheels et de leurs dépendances
-peut varier selon les modules ; en cas d'échec, consulter `avail_wheels` ou le support Valeria.
-Aucun téléchargement PyPI ni installation RAPIDS n'est tenté automatiquement.
+Depuis la racine du dépôt, avec la wheelhouse Valeria configurée et l'accès à PyPI :
+
+```bash
+python -m pip --isolated install --only-binary=:all: --index-url https://pypi.org/simple -r requirement.txt
+python -m pip check
+python -c 'import runpy; exec(runpy.run_path("00_package_installs.py")["SMOKE_TEST"])'
+```
+
+PyPI est nécessaire dans la configuration observée pour MNE 1.12.1, `EntropyHub`,
+`EMD-signal` et CuPy. MNE 1.9.0 est incompatible avec le SciPy 1.18.1 observé pour la
+lecture EDF. Pour vérifier cette lecture avec les données Mumtaz :
+
+```bash
+python -c "import mne; r = mne.io.read_raw_edf('data_eeg/mumtaz/H S1 EC.edf', preload=False, verbose=False); print('EDF OK:', len(r.ch_names), 'channels'); r.close()"
+```
+
+Vérifier que pip voit les chemins de la wheelhouse Valeria ; ne pas remplacer ses wheels
+scientifiques par des versions PyPI si elles sont indisponibles. L'installation en une
+commande à partir du fichier n'a pas encore été testée sur Valeria ; la disponibilité des
+wheels et de leurs dépendances peut varier. Le script `00_package_installs.py` conserve ses
+anciens réglages : il demande MNE 1.12.1 et une installation exclusivement depuis la
+wheelhouse, ce qui a échoué dans l'environnement observé.
+
 Cette installation est à effectuer une seule fois : le lanceur `00_pipeline.py` exécute ensuite
 les étapes 01 à 06 et 08 à 10 dans l'environnement activé, sans réinstaller les paquets.
 L'étape 07 reste accessible explicitement via `--etapes 7 10` ou directement. La synthèse
@@ -113,16 +142,18 @@ une erreur ultérieure n'est pas masquée. `--cpu-entropies` force le CPU dans l
 en exécution directe, `03 --calcul cpu`, `auto` ou `cuda` sélectionne le dispositif
 (`cuda` échoue si le GPU est indisponible). Le cache du lanceur tient compte du dispositif.
 
-Vérifier `avail_wheels cupy` ; si la wheelhouse fournit une version compatible avec
-l'environnement et CUDA 12, l'installation possible dans l'environnement activé est :
+Le fichier `requirement.txt` inclut `cupy-cuda12x==14.2.0`, installé depuis PyPI dans
+l'environnement observé. Charger `cuda/12.6` avant de l'utiliser : les en-têtes CUDA
+sont nécessaires. Vérifier la détection dans chaque session GPU :
 
 ```bash
-python -m pip install --no-index --only-binary=:all: cupy-cuda12x
-python -m pip check
+module load cuda/12.6
+python -c "from eeg_gpu_entropies import detecter_cuda; detecter_cuda()"
 ```
 
-Le calcul GPU n'a pas encore été vérifié sur Valeria : comparer ses résultats à ceux du
-CPU avant de les interpréter. Il peut aussi être plus lent pour de petits signaux.
+La détection a réussi sur Valeria, mais l'extraction complète GPU reste à vérifier :
+comparer ses résultats à ceux du CPU avant de les interpréter. Elle peut aussi être plus
+lente pour de petits signaux.
 
 Pour Jupyter, après activation, enregistrer un noyau avec un nom qui n'existe pas déjà :
 
