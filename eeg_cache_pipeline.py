@@ -14,7 +14,8 @@ CODE = {
     2: ["02_controle_qualite.py", "eeg_config.py", "eeg_utils.py", "eeg_donnees.py", "eeg_pretraitement.py"],
     3: ["03_extraction_entropies.py", "eeg_config.py", "eeg_utils.py", "eeg_donnees.py",
         "eeg_pretraitement.py", "eeg_gpu_entropies.py"],
-    4: ["04_fusion_harmonisation.py", "eeg_config.py", "eeg_utils.py", "eeg_donnees.py", "eeg_harmonisation.py"],
+    4: ["04_fusion_harmonisation.py", "eeg_config.py", "eeg_utils.py", "eeg_donnees.py", "eeg_harmonisation.py",
+        "eeg_fenetres.py"],
 }
 PAQUETS = {
     1: ["numpy", "scipy", "pandas", "mne"],
@@ -77,7 +78,8 @@ def verifier_sorties(etape, chemins):
     else:
         required = [(chemins[0], ["entropies_sujets.csv", "amplitude_sujets.csv", "meta_sujets.csv",
                                    "entropies_etendues_sujets.csv", "puissances_sujets.csv",
-                                   "entropies_multiechelle_sujets.csv", "fusion.json"])]
+                                   "entropies_multiechelle_sujets.csv", "fusion.json", "partition_sujets.csv",
+                                   "fenetres_communes.csv"] + [f"fenetres_{base}.csv" for base in BASES])]
     for directory, names in required:
         absent = [name for name in names if not (directory / name).is_file() or (directory / name).stat().st_size == 0]
         if absent:

@@ -3,6 +3,9 @@
 Entrée  : les 3 dossiers d'extraction (sorties/03_extraction/<base>_<date>/, le plus récent par
           défaut) ou d'anciens dossiers extraction_corrigee.py (--depression, --schizophrenie, --anxiete).
 Sortie  : sorties/04_fusion/<date>/
+    fenetres_<base>.csv      une ligne par fenêtre, tous les canaux de chaque base
+    fenetres_communes.csv    fenêtres fusionnées sur les canaux communs
+    partition_sujets.csv     groupes stratifiés base × étiquette : environ 80 % train, 20 % test
     entropies_sujets.csv     une ligne par sujet, colonnes « canal|bande|mesure »
                              (10 canaux × 5 composantes × 5 mesures = 250 variables)
     amplitude_sujets.csv     log de l'écart-type avant standardisation, « log_sd|canal|bande »
@@ -21,8 +24,8 @@ Sortie  : sorties/04_fusion/<date>/
   1. noms d'électrodes ramenés au 10-10 (T3→T7, T4→T8, T5→P7, T6→P8) ; colonnes numérotées
      col01... converties avec l'ordre SUPPOSÉ (Borisov, Emotiv) ou --carte-canaux ;
   2. électrodes communes aux 3 bases (F7, F3, F4, F8, T7, T8, P7, P8, O1, O2 attendues) ;
-  3. agrégation des fenêtres par sujet (moyenne ou médiane) ;
-  4. fusion en 4 classes ; groupes de validation préfixés par la base.
+  3. fusion des fenêtres en 4 classes et partition par groupe de validation ;
+  4. agrégation descriptive par sujet (moyenne ou médiane), conservée pour 07–09.
 
 IMPORTANT : les fichiers harmonise_*.csv et les figures sont DESCRIPTIFS (harmonisation ajustée
 sur tous les témoins). Les analyses 06 et 07 ré-ajustent l'harmonisation dans chaque pli,
@@ -45,6 +48,7 @@ import eeg_harmonisation as eh
 from eeg_config import BANDS, BASES, CANAUX, CLASSES, MEASURES, MESURES_ETENDUES, ORDRE_SUPPOSE, PUISSANCES
 from eeg_donnees import (agreger, agreger_multiechelle, ajouter_arguments_extraction, construire_fusion, decomposer_colonnes, dossiers_extraction,
                          lire_carte_canaux)
+from eeg_fenetres import matrice_fenetres, partition_sujets
 from eeg_utils import arguments_dict, ecrire_json, entete, log, nouveau_dossier, plt_agg, versions
 
 
@@ -67,6 +71,13 @@ def main():
     try:
         runs = dossiers_extraction(args)
         infos, common, ent, amp, meta = construire_fusion(runs, lire_carte_canaux(args.carte_canaux), args.agregation)
+        meta["partition"] = partition_sujets(meta)
+        fenetres = {b: matrice_fenetres(infos[b], infos[b]["channels"],
+                                       meta.loc[meta["base"].eq(b)], args.caracteristiques_etendues)
+                    for b in BASES}
+        communes = pd.concat([matrice_fenetres(infos[b], common, meta.loc[meta["base"].eq(b)],
+                                                args.caracteristiques_etendues) for b in BASES],
+                             ignore_index=True)
         if args.caracteristiques_etendues:
             extras = pd.concat([agreger(infos[b], common, MESURES_ETENDUES)[0] for b in BASES]).reindex(meta.index)
             power = pd.concat([agreger(infos[b], common, PUISSANCES)[0] for b in BASES]).reindex(meta.index)
@@ -91,6 +102,11 @@ def main():
     log(f"Variables : {ent.shape[1]} entropies, {amp.shape[1]} amplitudes ; agrégation {args.agregation} ; "
         f"manquantes {int(ent.isna().sum().sum())} / {int(amp.isna().sum().sum())}")
 
+    for b in BASES:
+        fenetres[b].to_csv(out / f"fenetres_{b}.csv", index=False)
+    communes.to_csv(out / "fenetres_communes.csv", index=False)
+    meta[["base", "label_binaire", "classe", "groupe", "partition"]].to_csv(out / "partition_sujets.csv")
+    log("Partition groupée 80/20 : " + str(meta.groupby("partition")["groupe"].nunique().to_dict()))
     ent.to_csv(out / "entropies_sujets.csv")
     amp.to_csv(out / "amplitude_sujets.csv")
     meta.to_csv(out / "meta_sujets.csv")
@@ -106,6 +122,7 @@ def main():
         "correspondance_canaux": {b: {str(k): v for k, v in infos[b]["mapping"].items()} for b in BASES},
         "carte_canaux": str(args.carte_canaux) if args.carte_canaux else None,
         "agregation": args.agregation,
+        "partition": "80/20 des groupes, stratifiée par base et étiquette ; graine fixe",
         "effectifs": {b: {"temoins": int(((meta.base == b) & (meta.classe == 0)).sum()),
                           "trouble": int(((meta.base == b) & (meta.classe > 0)).sum()),
                           "groupes": int(meta.loc[meta.base == b, "groupe"].nunique())} for b in BASES},

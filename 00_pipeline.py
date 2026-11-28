@@ -148,11 +148,11 @@ def main():
         if e == 4:
             for base, path in zip(BASES, sorted(inputs, key=lambda p: BASES.index(p.name.split("_", 1)[0]))):
                 cmd += [f"--{base}", str(path)]
-        if e in (5, 7, 8, 9) and 3 in resultats:
+        if e in (7, 8, 9) and 3 in resultats:
             for path in resultats[3]:
                 base = path.name.split("_", 1)[0]
                 cmd += [f"--{base}", str(path)]
-        if e in (6, 7, 8, 9) and 4 in resultats:
+        if e in (5, 6, 7, 8, 9) and 4 in resultats:
             cmd += ["--fusion", str(resultats[4][0])]
         if e == 10 and not any(step == 7 and code == 0 for step, _, code, _ in bilan):
             cmd += ["--sans-profond"]

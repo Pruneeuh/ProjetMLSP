@@ -1,15 +1,14 @@
 """Étape 5 : classification binaire trouble contre témoins, base par base.
 
-Entrée  : dossiers d'extraction (sorties/03_extraction/<base>_<date>/ les plus récents, ou anciens
-          dossiers extraction_corrigee.py avec --depression, --schizophrenie, --anxiete)
+Entrée  : fusion de l'étape 04 (--fusion), fenêtres et partition groupée persistée
 Sortie  : sorties/05_binaire/<date>/
-    metriques_par_repetition.csv, resume.csv, predictions_hors_pli.csv
+    metriques_par_repetition.csv, resume.csv, predictions_test.csv
     ablation.csv               (--ablation) régression logistique sur une seule mesure / une seule bande
     permutations.csv           (--permutations N) test de permutation au niveau des sujets
     roc_<base>.png, confusion_<base>.png
     parametres.json
 
-Pour chaque base : une ligne par sujet (médiane ou moyenne des fenêtres), tous les canaux de la
+Pour chaque base : une ligne par fenêtre, tous les canaux de la
 base (19 / 16 / 14) ou les 10 canaux communs (--canaux-communs). Modèles (--modeles) :
     reference_majoritaire   classe la plus fréquente
     regression_logistique   classes pondérées (L1/L2 réglées par recherche)
@@ -17,9 +16,10 @@ base (19 / 16 / 14) ou les 10 canaux communs (--canaux-communs). Modèles (--mod
 Références de confusion (ajoutées d'office) :
     reference_amplitude       régression logistique sur log(écart-type avant standardisation) seul
     reference_canaux_origine  nombre de canaux du fichier d'origine seul (dépression : 20 ou 22)
-Validation : StratifiedGroupKFold par sujet (387-02w1 / 387-03w1 dans le même groupe), répétée
---repetitions fois avec des graines successives ; prétraitement ajusté dans chaque pli.
-Recherche aléatoire imbriquée groupée pour tous les modèles (sauf référence majoritaire).
+Validation : partition 80/20 par groupe de l'étape 04, partagée avec 06. Les probabilités des
+fenêtres test sont moyennées par sujet. Les répétitions utilisent le même test et changent la graine.
+Recherche aléatoire en plis groupés sur train seulement (sauf référence majoritaire).
+Les ablations et permutations utilisent une validation croisée sur train seulement.
 --sans-tuning désactive la recherche ; --profil-tuning quick permet un essai rapide.
 --caracteristiques : classiques, etendues, ou etendues_puissances (défaut).
 Les jeux étendus exigent les caractéristiques correspondantes dans l'extraction 03.
@@ -48,11 +48,10 @@ import numpy as np
 import pandas as pd
 from sklearn.metrics import confusion_matrix
 
-from eeg_config import BANDS, BASES, CLASSES_BINAIRES, GRAINE, MEASURES, MESURES_ETENDUES, NOM_TROUBLE, PUISSANCES
-from eeg_donnees import (agreger, agreger_multiechelle, ajouter_arguments_extraction, charger_extraction, dossier_extraction_defaut,
-                         lire_carte_canaux)
+from eeg_config import BASES, CLASSES_BINAIRES, GRAINE, NOM_TROUBLE
+from eeg_fenetres import charger_fenetres, moyenner_sujets, plis_groupes
 from eeg_utils import (Compteur, arguments_dict, ecrire_json, entete, fmt_table, log,
-                       make_folds, multiclass_scores, nouveau_dossier, p_valeur_permutation,
+                       multiclass_scores, nouveau_dossier, p_valeur_permutation,
                        plot_confusion, plot_roc, require, scores_binaires, summarise, versions,
                        xgboost_disponible)
 
@@ -79,62 +78,48 @@ def cv_proba(nom, x, y, groups, folds, seed, args):
     return proba, fold_id, choix
 
 
-def preparer_base(base, run, args, orders):
-    info = charger_extraction(run, base, orders, args.agregation)
-    rec = info["records"]
-    canaux = info["channels"]
-    if args.canaux_communs:
-        canaux = [c for c in ["F7", "F3", "F4", "F8", "T7", "T8", "P7", "P8", "O1", "O2"] if c in canaux]
+def analyser_base(base, args, collect):
+    ent, amp, meta, info, dossier = charger_fenetres(args.fusion, base, args.caracteristiques,
+                                                     args.canaux_communs)
     if args.canaux_origine:
-        require("n_canaux_origine" in rec, "--canaux-origine : colonne n_canaux_origine absente de l'audit.")
-        keep = rec["n_canaux_origine"].eq(args.canaux_origine)
-        require(keep.sum() >= 2 * args.plis, f"Trop peu d'enregistrements à {args.canaux_origine} canaux d'origine.")
-        info["records"] = rec = rec.loc[keep]
-        info["data"] = info["data"].loc[info["data"]["subject_id"].isin(rec.index)]
-    mesures = list(MEASURES)
-    if args.caracteristiques != "classiques":
-        mesures += MESURES_ETENDUES
-    if args.caracteristiques == "etendues_puissances":
-        mesures += PUISSANCES
-    ent, amp = agreger(info, canaux, mesures)
-    if args.caracteristiques != "classiques":
-        ent = pd.concat([ent, agreger_multiechelle(info, canaux)], axis=1)
+        require(meta["n_canaux_origine"].notna().all(), "--canaux-origine : métadonnées absentes.")
+        keep = meta["n_canaux_origine"].eq(args.canaux_origine)
+        ent, amp, meta = ent.loc[keep].reset_index(drop=True), amp.loc[keep].reset_index(drop=True), meta.loc[keep].reset_index(drop=True)
+    y = meta["label_binaire"].astype(int).to_numpy()
+    groups = meta["groupe"].to_numpy()
+    train = np.flatnonzero(meta["partition"].eq("train"))
+    test = np.flatnonzero(meta["partition"].eq("test"))
+    require(len(train) and len(test) and set(y[train]) == {0, 1} and set(y[test]) == {0, 1},
+            f"{base} : la partition après filtrage doit contenir les deux classes dans train et test.")
     inputs = {"entropies": ent}
     if not args.sans_reference_amplitude:
         inputs["amplitude"] = amp
-    if "n_canaux_origine" in rec and rec["n_canaux_origine"].nunique() > 1:
-        inputs["canaux_origine"] = (rec["n_canaux_origine"] == rec["n_canaux_origine"].max()).astype(int).to_frame("canaux_max")
-    return info, canaux, inputs
-
-
-def analyser_base(base, run, args, orders, collect):
-    info, canaux, inputs = preparer_base(base, run, args, orders)
-    rec = info["records"]
-    y = rec["label"].astype(int).to_numpy()
-    groups = rec["group_validation"].astype(str).to_numpy()
-    ent = inputs["entropies"]
-    require(min(np.bincount(y)) >= args.plis, f"{base} : moins de sujets d'une classe que de plis.")
-    log(f"\n=== {base} ({NOM_TROUBLE[base]}) : {len(y)} sujets ({(y == 0).sum()} témoins, {(y == 1).sum()} trouble), "
-        f"{len(set(groups))} groupes, {len(canaux)} canaux, {ent.shape[1]} variables ({args.caracteristiques})")
+    origin = meta["n_canaux_origine"]
+    if origin.notna().all() and origin.iloc[train].nunique() > 1:
+        inputs["canaux_origine"] = origin.eq(origin.iloc[train].max()).astype(int).to_frame("canaux_max")
+    canaux = info["canaux_communs"] if args.canaux_communs else info["canaux_par_base"][base]
+    log(f"\n=== {base} ({NOM_TROUBLE[base]}) : {len(y)} fenêtres, "
+        f"{meta.subject_id.nunique()} sujets, {len(canaux)} canaux, {ent.shape[1]} variables")
     specs = [(m, "entropies") for m in args.modeles]
     if "amplitude" in inputs:
         specs.append(("reference_amplitude", "amplitude"))
     if "canaux_origine" in inputs:
         specs.append(("reference_canaux_origine", "canaux_origine"))
-        log(f"  canaux d'origine : {rec['n_canaux_origine'].value_counts().to_dict()} → référence ajoutée")
+        log("  Référence du nombre de canaux d'origine ajoutée")
     task = f"binaire_{base}"
-    folds_by_rep = [make_folds(y, groups, args.plis, args.graine + r, must_have=y, min_par_strate=2)
-                    for r in range(args.repetitions)]
+    folds_by_rep = [[(train, test)] for _ in range(args.repetitions)]
     for nom, feat in specs:
         t0 = time.time()
         x = inputs[feat].to_numpy(float)
         kind = "regression_logistique" if nom.startswith("reference_") and nom != "reference_majoritaire" else nom
         for rep, folds in enumerate(folds_by_rep):
             seed = args.graine + rep
-            proba, fold_id, choix = cv_proba(kind, x, y, groups, folds, seed, args)
-            row, pred = multiclass_scores(y, proba, [0, 1])
-            row.update(scores_binaires(y, pred))
-            tn, fp, fn, tp = confusion_matrix(y, pred, labels=[0, 1]).ravel()
+            proba, _, choix = cv_proba(kind, x, y, groups, folds, seed, args)
+            participants, p = moyenner_sujets(meta.iloc[test], y[test], proba[test])
+            yt = participants["classe"].to_numpy()
+            row, pred = multiclass_scores(yt, p, [0, 1])
+            row.update(scores_binaires(yt, pred))
+            tn, fp, fn, tp = confusion_matrix(yt, pred, labels=[0, 1]).ravel()
             row.update(vrais_temoins=tn, faux_trouble=fp, faux_temoins=fn, vrais_trouble=tp)
             if choix:
                 row["hyperparametres_choisis"] = "; ".join(str(c) for c in choix)
@@ -142,15 +127,17 @@ def analyser_base(base, run, args, orders, collect):
                                         repetition=rep + 1, n_variables=x.shape[1], **row))
             collect["preds"].append(pd.DataFrame({
                 "tache": task, "harmonisation": "aucune", "modele": nom, "repetition": rep + 1,
-                "subject_id": rec.index, "groupe": groups, "pli": fold_id, "classe": y, "prediction": pred,
-                "proba_temoin": proba[:, 0], "proba_trouble": proba[:, 1]}))
+                "subject_id": participants.index, "groupe": participants["groupe"], "pli": 1,
+                "classe": yt, "prediction": pred, "proba_temoin": p[:, 0], "proba_trouble": p[:, 1]}))
         sub = pd.DataFrame([r for r in collect["rows"] if r["tache"] == task and r["modele"] == nom])
         log(f"  {nom:<26s} exact. équilibrée {sub.exactitude_equilibree.mean():.3f} ± "
             f"{sub.exactitude_equilibree.std(ddof=1) if len(sub) > 1 else 0:.3f}, AUC {sub.auc.mean():.3f}  "
             f"({time.time() - t0:.0f} s)")
 
     if args.ablation:
-        log("  Ablation (régression logistique, une mesure ou une bande seule) :")
+        log("  Ablation sur les seuls sujets d'entraînement (validation croisée groupée) :")
+        folds_train = [plis_groupes(y[train], groups[train], args.plis, args.graine + r)
+                       for r in range(args.repetitions)]
         cols = pd.Series(ent.columns)
         mesures = list(dict.fromkeys(c.rsplit("|", 1)[-1] for c in ent.columns))
         groupes_var = {f"mesure={m}": cols.str.endswith("|" + m) for m in mesures}
@@ -158,11 +145,12 @@ def analyser_base(base, run, args, orders, collect):
         groupes_var.update({f"bande={b}": cols.str.contains(f"|{b}|", regex=False) for b in bandes})
         groupes_var.update({f"sans_mesure={m}": ~cols.str.endswith("|" + m) for m in mesures})
         for nom_g, mask in groupes_var.items():
-            x = ent.loc[:, mask.to_numpy()].to_numpy(float)
+            x = ent.loc[:, mask.to_numpy()].to_numpy(float)[train]
             vals = []
-            for rep, folds in enumerate(folds_by_rep):
-                proba, _, _ = cv_proba("regression_logistique", x, y, groups, folds, args.graine + rep, args)
-                vals.append(multiclass_scores(y, proba, [0, 1])[0])
+            for rep, folds in enumerate(folds_train):
+                proba, _, _ = cv_proba("regression_logistique", x, y[train], groups[train], folds, args.graine + rep, args)
+                participants, p = moyenner_sujets(meta.iloc[train], y[train], proba)
+                vals.append(multiclass_scores(participants["classe"], p, [0, 1])[0])
             v = pd.DataFrame(vals)
             collect["ablation"].append(dict(base=base, sous_ensemble=nom_g, n_variables=x.shape[1],
                                             exactitude_equilibree=v.exactitude_equilibree.mean(),
@@ -171,30 +159,38 @@ def analyser_base(base, run, args, orders, collect):
             log(f"    {nom_g:<26s} {v.exactitude_equilibree.mean():.3f} (AUC {v.auc.mean():.3f})")
 
     if args.permutations:
-        g = pd.Series(y, index=groups).groupby(level=0).first()
+        g = pd.Series(y[train], index=groups[train]).groupby(level=0).first()
         for nom in args.permutation_modeles:
             if nom not in args.modeles:
                 continue
             rng = np.random.default_rng(args.graine)
             t0 = time.time()
-            x = ent.to_numpy(float)
+            x = ent.to_numpy(float)[train]
+            yt, gt, mt = y[train], groups[train], meta.iloc[train]
+            observed = []
+            for rep in range(args.repetitions):
+                folds = plis_groupes(yt, gt, args.plis, args.graine + rep)
+                proba, _, _ = cv_proba(nom, x, yt, gt, folds, args.graine + rep, args)
+                participants, p = moyenner_sujets(mt, yt, proba)
+                observed.append(multiclass_scores(participants["classe"], p, [0, 1])[0]["exactitude_equilibree"])
             null = []
             for i in range(args.permutations):
-                yp = pd.Series(rng.permutation(g.to_numpy()), index=g.index).loc[groups].to_numpy()
+                yp = pd.Series(rng.permutation(g.to_numpy()), index=g.index).loc[gt].to_numpy()
                 repeated = []
                 for rep in range(args.repetitions):
                     seed = args.graine + rep
                     try:
-                        folds = make_folds(yp, groups, args.plis, seed, must_have=yp, min_par_strate=2)
+                        folds = plis_groupes(yp, gt, args.plis, seed)
                     except ValueError as exc:
                         log(f"    permutation {i + 1} ignorée : {exc}")
                         break
-                    proba, _, _ = cv_proba(nom, x, yp, groups, folds, seed, args)
-                    repeated.append(multiclass_scores(yp, proba, [0, 1])[0]["exactitude_equilibree"])
+                    proba, _, _ = cv_proba(nom, x, yp, gt, folds, seed, args)
+                    participants, p = moyenner_sujets(mt, yp, proba)
+                    repeated.append(multiclass_scores(participants["classe"], p, [0, 1])[0]["exactitude_equilibree"])
                 if len(repeated) != args.repetitions:
                     continue
                 null.append(np.mean(repeated))
-            obs = np.mean([r["exactitude_equilibree"] for r in collect["rows"] if r["tache"] == task and r["modele"] == nom])
+            obs = np.mean(observed)
             null = np.array(null)
             require(len(null) > 0, f"{base} : aucune permutation valide pour {nom}.")
             collect["perms"].append(dict(base=base, modele=nom, observe=obs, moyenne_nulle=null.mean(),
@@ -202,14 +198,13 @@ def analyser_base(base, run, args, orders, collect):
                                          n_permutations=len(null)))
             log(f"  permutations {nom} : nul {null.mean():.3f} (q95 {np.quantile(null, 0.95):.3f}), observé {obs:.3f}, "
                 f"p = {collect['perms'][-1]['p_valeur']:.3f} ({time.time() - t0:.0f} s)")
-    collect["infos"][base] = dict(dossier=str(run), canaux=canaux, sujets=len(y), temoins=int((y == 0).sum()),
-                                  trouble=int((y == 1).sum()), groupes=len(set(groups)), variables=int(ent.shape[1]),
-                                  groupes_multiples={k: int(v) for k, v in pd.Series(groups).value_counts().items() if v > 1})
+    collect["infos"][base] = dict(dossier=str(dossier), canaux=canaux, sujets=int(meta.subject_id.nunique()),
+                                  fenetres=len(y), groupes=len(set(groups)), variables=int(ent.shape[1]))
 
 
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ajouter_arguments_extraction(p)
+    p.add_argument("--fusion", type=Path, default=None, help="Fusion de l'étape 04 avec partition train/test.")
     p.add_argument("--bases", nargs="+", choices=BASES, default=BASES)
     p.add_argument("--canaux-communs", action="store_true", help="Seulement les 10 canaux communs aux 3 bases.")
     p.add_argument("--canaux-origine", type=int, default=None,
@@ -251,14 +246,11 @@ def main():
     log(f"Calcul : XGBoost={args.devices['xgboost']}, LightGBM={args.devices['lightgbm']}; "
         + ("RAPIDS actif : voir ses journaux GPU/CPU." if RAPIDS_ACTIF else "autres modèles sur CPU."))
     start = time.time()
-    orders = lire_carte_canaux(args.carte_canaux)
     collect = dict(rows=[], preds=[], ablation=[], perms=[], infos={})
     entete("CLASSIFICATION BINAIRE TROUBLE / TÉMOINS (une base à la fois)")
     try:
         for b in args.bases:
-            run = getattr(args, b) or dossier_extraction_defaut(b)
-            require(run is not None, f"Aucune extraction pour {b} (03_extraction_entropies.py ou --{b}).")
-            analyser_base(b, Path(run).expanduser().resolve(), args, orders, collect)
+            analyser_base(b, args, collect)
     except (OSError, ValueError) as exc:
         p.exit(1, f"Analyse arrêtée : {exc}\n")
 
@@ -270,7 +262,7 @@ def main():
                         ["tache", "base", "modele", "caracteristiques"])
     summary.to_csv(out / "resume.csv", index=False)
     preds = pd.concat(collect["preds"], ignore_index=True)
-    preds.to_csv(out / "predictions_hors_pli.csv", index=False)
+    preds.to_csv(out / "predictions_test.csv", index=False)
     if collect["ablation"]:
         pd.DataFrame(collect["ablation"]).to_csv(out / "ablation.csv", index=False)
     if collect["perms"]:
@@ -281,7 +273,7 @@ def main():
         pb = preds[(preds.tache == f"binaire_{b}") & (preds.repetition == 1)]
         courbes = [(m, g["classe"].to_numpy(), g["proba_trouble"].to_numpy())
                    for m, g in pb.groupby("modele", sort=False) if m != "reference_majoritaire"]
-        figures.append(plot_roc(courbes, f"{b} : courbes ROC hors pli (répétition 1)", out / f"roc_{b}.png"))
+        figures.append(plot_roc(courbes, f"{b} : courbes ROC sur les sujets test (répétition 1)", out / f"roc_{b}.png"))
         s = summary[(summary.base == b) & (summary.modele != "reference_majoritaire")
                     & ~summary.modele.str.startswith("reference_")]
         if len(s):
@@ -292,16 +284,17 @@ def main():
                                           f"{b} : {best} (cumul des répétitions)", out / f"confusion_{b}.png"))
 
     log("\n" + "=" * 78 + f"\nRÉSUMÉ (moyenne sur {args.repetitions} répétitions ; hasard = 0.50)")
+    log("Même test pour tous les modèles et répétitions : choisir le meilleur sur ce test est optimiste.")
     cols = ["base", "modele", "n_variables", "exactitude_equilibree", "exactitude_equilibree_std", "auc",
             "sensibilite", "specificite", "f1_macro", "brier"]
     log(fmt_table(summary.sort_values(["base", "exactitude_equilibree"], ascending=[True, False]), cols))
     if Compteur.non_converges:
         log(f"Avertissement : {Compteur.non_converges} ajustements non convergés.")
     ecrire_json(out / "parametres.json", {
-        "portee": "Évaluation exploratoire interne ; recherche imbriquée sauf --sans-tuning.",
+        "portee": "Évaluation exploratoire sur un test partagé ; choisir le meilleur modèle sur ce test est optimiste.",
         "bases": collect["infos"], "classes": CLASSES_BINAIRES,
-        "validation": f"StratifiedGroupKFold {args.plis} plis × {args.repetitions} répétitions, graines "
-                      f"{args.graine}..{args.graine + args.repetitions - 1}",
+        "validation": f"Partition 80/20 groupée de 04 ; {args.repetitions} ajustements sur le même test ; "
+                      "probabilités moyennées par sujet ; ablation et permutations en CV sur train seulement.",
         "figures": figures, "ajustements_non_converges": Compteur.non_converges,
         "duree_s": round(time.time() - start, 1), "arguments": arguments_dict(args),
         "versions": versions(("numpy", "pandas", "scikit-learn", "matplotlib", "xgboost"))})

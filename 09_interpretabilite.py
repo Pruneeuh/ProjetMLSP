@@ -290,6 +290,9 @@ def main():
     orders = lire_carte_canaux(args.carte_canaux)
     out = nouveau_dossier("interpretabilite")
     entete("INTERPRÉTABILITÉ : importance des mesures, bandes et électrodes")
+    log("ATTENTION : 09 explique des modèles distincts entraînés sur des caractéristiques agrégées "
+        "par sujet, en validation croisée sur tous les sujets. Il n'explique pas les modèles "
+        "sur fenêtres de 05/06 et peut inclure leurs sujets test.")
     collect = dict(imp=[], coef=[], shap=[], tuning=[])
     figures = []
     for t in args.taches:
@@ -319,6 +322,8 @@ def main():
         pd.DataFrame(collect["tuning"]).to_csv(out / "hyperparametres_par_pli.csv", index=False)
     ecrire_json(out / "interpretabilite.json", {
         "methode": "importance par permutation de groupes de variables, hors pli, sans réentraînement",
+        "portee": "Modèles sur caractéristiques agrégées par sujet, distincts des modèles sur fenêtres "
+                  "de 05/06 ; validation croisée sur tous les sujets, y compris le test de 04.",
         "figures": figures, "arguments": arguments_dict(args),
         "versions": versions(("numpy", "pandas", "scikit-learn", "matplotlib", "shap"))})
     log(f"\nSORTIE : {out}")

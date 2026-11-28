@@ -3,7 +3,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from eeg_cache_pipeline import CachePipeline, signature
+from eeg_cache_pipeline import CachePipeline, signature, verifier_sorties
 from eeg_config import BASES
 
 
@@ -60,6 +60,16 @@ class PipelineCacheTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 cache.enregistrer(2, "key", [root])
             self.assertFalse(cache.path.exists())
+
+    def test_participant_only_fusion_cannot_be_reused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for name in ("entropies_sujets.csv", "amplitude_sujets.csv", "meta_sujets.csv",
+                         "entropies_etendues_sujets.csv", "puissances_sujets.csv",
+                         "entropies_multiechelle_sujets.csv", "fusion.json"):
+                (root / name).write_text("legacy", encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "fenetres_communes.csv"):
+                verifier_sorties(4, [root])
 
 
 if __name__ == "__main__":

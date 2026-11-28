@@ -3,7 +3,7 @@ harmonisation dans les plis, contrôles de l'effet de site, permutations et leav
 
 Entrée  : sorties/04_fusion/<date>/ (la plus récente, ou --fusion <dossier>)
 Sortie  : sorties/06_multiclasse/<date>/
-    multiclasse_metriques.csv, multiclasse_resume.csv, predictions_hors_pli.csv
+    multiclasse_metriques.csv, multiclasse_resume.csv, predictions_test.csv
     matrice_confusion_<modèle>__<harmonisation>.png  (4 classes + témoins séparés par base)
     controle_site_metriques.csv, controle_site_resume.csv, controle_site_temoins.png
     permutations.csv, lodo_metriques.csv, lodo_resume.csv
@@ -14,10 +14,11 @@ Sortie  : sorties/06_multiclasse/<date>/
   2. Modèles : référence majoritaire, régression logistique, MLP, SVM, kNN, forêt, LDA,
      XGBoost, LightGBM, référence amplitude (log écart-type).
      Recherche imbriquée groupée par défaut ; --sans-tuning pour la désactiver.
-  3. Évaluation : StratifiedGroupKFold par sujet (strates = base × étiquette), --repetitions fois ;
+  3. Évaluation sur le test groupé de 04 (environ 20 %) ; probabilités des fenêtres moyennées
+     par sujet. Les répétitions utilisent le même test et changent la graine ;
      exactitude équilibrée, F1 macro, AUC un-contre-tous, Brier, rappel par classe, part des
      témoins de chaque base reconnus comme témoins.
-  4. Contrôles de site :
+  4. Contrôles de site et permutations en validation croisée sur les seuls sujets train :
      (a) prédire la base d'origine, tous les sujets, avant / après harmonisation ;
      (b) prédire la base des TÉMOINS seulement (hasard = 33 % si le site est neutralisé).
          Après z-score, la régression logistique y est au hasard PAR CONSTRUCTION ; le MLP
@@ -25,7 +26,7 @@ Sortie  : sorties/06_multiclasse/<date>/
      (c) tests de permutation : globale (toutes étiquettes mélangées) et intra-base
          (témoins/patients mélangés dans chaque base : le site reste, le trouble disparaît).
          Le « gain sur nul » intra-base est l'apport lié au trouble au-delà du site.
-  5. Leave-one-dataset-out : trouble contre témoin, entraînement sur 2 bases, test sur la 3e ;
+  5. Leave-one-dataset-out sur train seulement : trouble contre témoin, entraînement sur 2 bases, test sur la 3e ;
      base test harmonisée sur une partie de ses témoins (exclus de l'évaluation) ou sur tous
      ses sujets sans étiquette.
 
@@ -56,8 +57,8 @@ from sklearn.metrics import confusion_matrix, recall_score
 
 import eeg_harmonisation as eh
 from eeg_config import BASES, CLASS_OF_BASE, CLASSES, GRAINE
-from eeg_donnees import caracteristiques_fusion, charger_fusion
-from eeg_utils import (Compteur, arguments_dict, ecrire_json, entete, fmt_table, log, make_folds,
+from eeg_fenetres import charger_fenetres, moyenner_sujets, plis_groupes
+from eeg_utils import (Compteur, arguments_dict, ecrire_json, entete, fmt_table, log,
                        multiclass_scores, nouveau_dossier, p_valeur_permutation, plot_confusion, plt_agg,
                        summarise, versions, xgboost_disponible)
 
@@ -97,21 +98,25 @@ def strates(meta):
 
 
 # --------------------------------------------------------------------------- analyses
-def main_analysis(x_by_feat, meta, args, specs, tuning):
+def main_analysis(x_by_feat, meta, args, specs, tuning, holdout=False):
+    if "subject_id" not in meta:
+        meta = meta.assign(subject_id=meta.index)
     y = meta["classe"].to_numpy()
     bases = meta["base"].to_numpy()
     groups = meta["groupe"].to_numpy()
     strata = strates(meta)
     ref = y == 0
     labels = list(range(len(CLASSES)))
-    temoin_base = np.where(y == 0, bases, "")
-    row_id = np.where(y == 0, pd.Categorical(bases, BASES).codes, len(BASES) - 1 + y)
     rows, preds = [], []
     confusion = {spec_id(s): np.zeros((len(CLASSES), len(CLASSES)), dtype=int) for s in specs}
     detail = {spec_id(s): np.zeros((len(BASES) + 3, len(CLASSES)), dtype=int) for s in specs}
     for rep in range(args.repetitions):
         seed = args.graine + rep
-        folds = make_folds(strata, groups, args.plis, seed, must_have=strata)
+        if holdout:
+            folds = [(np.flatnonzero(meta["partition"].eq("train")),
+                      np.flatnonzero(meta["partition"].eq("test")))]
+        else:
+            folds = plis_groupes(strata, groups, args.plis, seed)
         for spec in specs:
             t0 = time.time()
             key = (spec["caracteristiques"], spec["harmonisation"])
@@ -119,21 +124,28 @@ def main_analysis(x_by_feat, meta, args, specs, tuning):
                 y, folds, x_by_feat[key[0]], bases, ref, groups, strata, key[1], spec["kind"],
                 len(CLASSES), seed, args, tuning,
                 dict(tache="multiclasse", modele=spec["modele"], harmonisation=key[1], repetition=rep + 1))
-            row, pred = multiclass_scores(y, proba, labels)
+            evaluate = np.concatenate([te for _, te in folds])
+            participants, p = moyenner_sujets(meta.iloc[evaluate], y[evaluate], proba[evaluate])
+            yt = participants["classe"].to_numpy()
+            bt = participants["base"].to_numpy()
+            row, pred = multiclass_scores(yt, p, labels)
             for c, cname in enumerate(CLASSES):
-                row[f"rappel_{cname}"] = recall_score(y == c, pred == c, zero_division=0)
+                row[f"rappel_{cname}"] = recall_score(yt == c, pred == c, zero_division=0)
             for b in BASES:
-                row[f"temoins_{b}_bien_classes"] = float(np.mean(pred[temoin_base == b] == 0))
+                row[f"temoins_{b}_bien_classes"] = float(np.mean(pred[(yt == 0) & (bt == b)] == 0))
             row["nombre_variables"] = n_variables
             rows.append(dict(tache="multiclasse", modele=spec["modele"], harmonisation=spec["harmonisation"],
                              repetition=rep + 1, **row))
             sid = spec_id(spec)
-            confusion[sid] += confusion_matrix(y, pred, labels=labels)
+            confusion[sid] += confusion_matrix(yt, pred, labels=labels)
+            row_id = np.where(yt == 0, pd.Categorical(bt, BASES).codes, len(BASES) - 1 + yt)
             np.add.at(detail[sid], (row_id, pred), 1)
+            fold_per_subject = pd.Series(fold_id[evaluate], index=meta.iloc[evaluate]["subject_id"]).groupby(level=0).first()
             preds.append(pd.DataFrame({
                 "tache": "multiclasse", "harmonisation": spec["harmonisation"], "modele": spec["modele"],
-                "repetition": rep + 1, "subject_id": meta.index, "base": bases, "groupe": groups, "pli": fold_id,
-                "classe": y, "prediction": pred, **{f"proba_{c}": proba[:, i] for i, c in enumerate(CLASSES)}}))
+                "repetition": rep + 1, "subject_id": participants.index, "base": bt,
+                "groupe": participants["groupe"], "pli": fold_per_subject.reindex(participants.index).to_numpy(),
+                "classe": yt, "prediction": pred, **{f"proba_{c}": p[:, i] for i, c in enumerate(CLASSES)}}))
             if rep == 0:
                 log(f"  {spec['modele']:<26s} {spec['harmonisation']:<15s} répétition 1 : "
                     f"{row['exactitude_equilibree']:.3f} ({time.time() - t0:.1f} s)")
@@ -156,13 +168,14 @@ def site_controls(x_by_feat, meta, args, kinds):
         t0 = time.time()
         for rep in range(args.repetitions):
             seed = args.graine + rep
-            folds = make_folds(strata, groups, args.plis, seed, must_have=strata)
+            folds = plis_groupes(strata, groups, args.plis, seed)
             for feat in ["entropies", "amplitude"]:
                 for method in methods:
                     for kind in kinds:
                         proba, _, _ = cross_val_proba(y, folds, x_by_feat[feat][mask], bases, ref,
                                                       groups, strata, method, kind, len(BASES), seed, args)
-                        row, _ = multiclass_scores(y, proba, list(range(len(BASES))))
+                        participants, p = moyenner_sujets(meta.loc[mask], y, proba)
+                        row, _ = multiclass_scores(participants["classe"], p, list(range(len(BASES))))
                         rows.append(dict(population=population, caracteristiques=feat, harmonisation=method,
                                          modele=kind, repetition=rep + 1, **row))
         log(f"  {population} : {time.time() - t0:.0f} s")
@@ -203,14 +216,15 @@ def permutation_tests(x_by_feat, meta, args, observed, specs):
                     seed = args.graine + rep
                     strata = base_codes * 2 + lab
                     try:
-                        folds = make_folds(strata, groups, args.plis, seed)
+                        folds = plis_groupes(strata, groups, args.plis, seed)
                     except ValueError as exc:
                         log(f"    permutation {i + 1} ignorée : {exc}")
                         break
                     proba, _, _ = cross_val_proba(
                         classe, folds, x_by_feat[spec["caracteristiques"]], bases, classe == 0,
                         groups, strata, spec["harmonisation"], spec["kind"], len(CLASSES), seed, args)
-                    repeat_scores.append(multiclass_scores(classe, proba, labels)[0])
+                    participants, p = moyenner_sujets(meta, classe, proba)
+                    repeat_scores.append(multiclass_scores(participants["classe"], p, labels)[0])
                 if len(repeat_scores) != args.repetitions:
                     continue
                 scores.append(pd.DataFrame(repeat_scores).mean().to_dict())
@@ -265,12 +279,14 @@ def lodo(x_by_feat, meta, args, specs):
                                            strates(meta)[tr], bases[tr], ref_tr, key[1], seed, args)
                     model.fit(x_tr, y[tr])
                     proba = predict_proba(model, x_te, 2)
-                    row, pred = multiclass_scores(y[te], proba, [0, 1])
-                    row["sensibilite"] = recall_score(y[te], pred, zero_division=0)
-                    row["specificite"] = recall_score(y[te], pred, pos_label=0, zero_division=0)
+                    participants, p = moyenner_sujets(meta.loc[te], y[te], proba)
+                    yt = participants["classe"].to_numpy()
+                    row, pred = multiclass_scores(yt, p, [0, 1])
+                    row["sensibilite"] = recall_score(yt, pred, zero_division=0)
+                    row["specificite"] = recall_score(yt, pred, pos_label=0, zero_division=0)
                     rows.append(dict(base_test=test_base, harmonisation_base_test=mode, modele=spec["modele"],
                                      harmonisation=spec["harmonisation"], repetition=rep + 1,
-                                     n_test=int(te.sum()), temoins_test=int((y[te] == 0).sum()), **row))
+                                     n_test=len(yt), temoins_test=int((yt == 0).sum()), **row))
         log(f"  base test {test_base} : terminé")
     return pd.DataFrame(rows)
 
@@ -307,7 +323,7 @@ def plot_site_controls(site_summary, out):
         for i, m in enumerate(models):
             s = sub[sub["modele"] == m].set_index("harmonisation").reindex(methods)
             ax.bar(np.arange(len(methods)) + i * width - 0.4 + width / 2, s["exactitude_equilibree"],
-                   width, yerr=s["exactitude_equilibree_std"], label=m, capsize=3)
+                   width, yerr=s["exactitude_equilibree_std"].fillna(0), label=m, capsize=3)
         ax.axhline(1 / 3, color="black", linestyle="--", linewidth=1, label="hasard")
         ax.set_xticks(range(len(methods)), methods, rotation=20)
         ax.set_title(f"Témoins seulement, {feat}")
@@ -376,8 +392,8 @@ def main():
 
     start = time.time()
     try:
-        common, ent, amp, meta, finfo, fdir = charger_fusion(args.fusion)
-        ent = caracteristiques_fusion(common, ent, meta, fdir, args.caracteristiques)
+        ent, amp, meta, finfo, fdir = charger_fenetres(args.fusion, choix=args.caracteristiques)
+        common = finfo["canaux_communs"]
     except (OSError, ValueError) as exc:
         p.exit(1, f"Chargement arrêté : {exc}\n")
     x_by_feat = {"entropies": ent.to_numpy(float), "amplitude": amp.to_numpy(float)}
@@ -386,12 +402,12 @@ def main():
     log(f"Fusion : {fdir}")
     log(f"Canaux communs ({len(common)}) : {', '.join(common)}")
     counts = meta["classe"].value_counts().sort_index()
-    log("Classes : " + ", ".join(f"{i}={CLASSES[i]} ({counts.get(i, 0)})" for i in range(len(CLASSES))))
+    log("Fenêtres par classe : " + ", ".join(f"{i}={CLASSES[i]} ({counts.get(i, 0)})" for i in range(len(CLASSES))))
     log(f"Variables : {ent.shape[1]} ({args.caracteristiques}), {amp.shape[1]} amplitudes de référence")
     log("Dans les contrôles de site, « entropies » désigne le jeu de variables sélectionné.")
     log(f"Harmonisations : {', '.join(args.harmonisations)} (+ « aucune ») ; modèles : {', '.join(args.modeles)}")
-    log(f"Validation : StratifiedGroupKFold {args.plis} plis × {args.repetitions} répétitions "
-        "(strates = base × étiquette ; harmonisation ajustée dans chaque pli sur les témoins d'entraînement)")
+    log("Validation : partition 80/20 groupée de 04 ; test évalué par sujet après moyenne des fenêtres. "
+        "Harmonisation et tuning ajustés sur train seulement.")
 
     specs = [dict(modele="reference_majoritaire", caracteristiques="entropies", kind="reference_majoritaire",
                   harmonisation=args.harmonisations[0])]
@@ -408,19 +424,22 @@ def main():
     tuning = []
     try:
         log("\n[1/4] Classification 4 classes")
-        metrics, preds, confusion, detail = main_analysis(x_by_feat, meta, args, specs, tuning)
+        metrics, preds, confusion, detail = main_analysis(x_by_feat, meta, args, specs, tuning, holdout=True)
         summary = summarise(metrics, ["tache", "harmonisation", "modele"])
         metrics.to_csv(out / "multiclasse_metriques.csv", index=False)
         summary.to_csv(out / "multiclasse_resume.csv", index=False)
-        preds.to_csv(out / "predictions_hors_pli.csv", index=False)
+        preds.to_csv(out / "predictions_test.csv", index=False)
         if tuning:
             pd.DataFrame(tuning).to_csv(out / "hyperparametres_par_pli.csv", index=False)
         figures += plot_confusions(confusion, detail, out)
 
+        train_mask = meta["partition"].eq("train").to_numpy()
+        train_meta = meta.loc[train_mask].reset_index(drop=True)
+        train_x = {key: value[train_mask] for key, value in x_by_feat.items()}
         if not args.sans_controles_site:
-            log("\n[2/4] Contrôles de site (a) et (b)")
+            log("\n[2/4] Contrôles de site en validation croisée sur train seulement")
             kinds = [k for k in ["regression_logistique", "mlp", "xgboost"] if k in args.modeles] or ["regression_logistique"]
-            site = site_controls(x_by_feat, meta, args, kinds)
+            site = site_controls(train_x, train_meta, args, kinds)
             site_summary = summarise(site, ["population", "caracteristiques", "harmonisation", "modele"])
             site.to_csv(out / "controle_site_metriques.csv", index=False)
             site_summary.to_csv(out / "controle_site_resume.csv", index=False)
@@ -431,13 +450,14 @@ def main():
             pspecs = [s for s in specs if s["modele"] in args.permutation_modeles and s["harmonisation"] != "aucune"]
             if not pspecs:
                 raise ValueError("Aucun modèle de permutation n'est sélectionné dans --modeles.")
-            perm = permutation_tests(x_by_feat, meta, args, metrics, pspecs)
+            observed, _, _, _ = main_analysis(train_x, train_meta, args, pspecs, [])
+            perm = permutation_tests(train_x, train_meta, args, observed, pspecs)
             perm.to_csv(out / "permutations.csv", index=False)
 
         if not args.sans_lodo:
             log("\n[4/4] Leave-one-dataset-out (trouble contre témoin)")
             lspecs = [s for s in specs if s["harmonisation"] != "aucune"]
-            lodo_df = lodo(x_by_feat, meta, args, lspecs)
+            lodo_df = lodo(train_x, train_meta, args, lspecs)
             lodo_summary = summarise(lodo_df, ["base_test", "harmonisation_base_test", "harmonisation", "modele"])
             lodo_df.to_csv(out / "lodo_metriques.csv", index=False)
             lodo_summary.to_csv(out / "lodo_resume.csv", index=False)
@@ -447,6 +467,7 @@ def main():
     # ------------------------------------------------------------------ résumé console
     order = {h: i for i, h in enumerate(["aucune"] + args.harmonisations)}
     entete(f"RÉSULTATS 4 CLASSES (moyenne ± écart-type sur {args.repetitions} répétitions ; hasard = 0.25)")
+    log("Même test pour tous les modèles et répétitions : choisir le meilleur sur ce test est optimiste.")
     s = summary.copy()
     s["_o"] = s["harmonisation"].map(order)
     s = s.sort_values(["_o"], kind="stable")
@@ -497,7 +518,8 @@ def main():
     if Compteur.non_converges:
         log(f"\nAvertissement : {Compteur.non_converges} ajustements non convergés (voir max_iter).")
     ecrire_json(out / "controle_multiclasse.json", {
-        "portee": "Évaluation exploratoire ; ordre des électrodes schizophrénie/anxiété supposé.",
+        "portee": "Évaluation exploratoire sur un test partagé ; choix du meilleur modèle sur ce test optimiste ; "
+                  "ordre des électrodes schizophrénie/anxiété supposé.",
         "fusion": str(fdir), "dossiers_extraction": finfo.get("dossiers_extraction"),
         "canaux_communs": common,
         "effectifs": finfo.get("effectifs"),
@@ -507,7 +529,8 @@ def main():
                         f"(forêt d'arbres extrêmes, {args.filtrage_arbres} arbres)",
             "coral": f"z-score, ACP {args.coral_composantes} composantes sur les témoins, CORAL Ledoit-Wolf",
             "filtrage_coral": "filtrage puis CORAL"},
-        "validation": f"StratifiedGroupKFold {args.plis} plis, graines {args.graine}..{args.graine + args.repetitions - 1}",
+        "validation": f"Partition 80/20 groupée de 04, {args.repetitions} ajustements sur le même test ; "
+                      "diagnostics et permutations sur train uniquement.",
         "figures": figures, "ajustements_non_converges": Compteur.non_converges,
         "duree_s": round(time.time() - start, 1), "arguments": arguments_dict(args),
         "versions": versions(("numpy", "pandas", "scikit-learn", "matplotlib", "xgboost"))})

@@ -15,6 +15,7 @@ from sklearn.svm import SVC
 
 import eeg_harmonisation as eh
 from eeg_utils import make_folds
+from eeg_fenetres import plis_groupes
 
 
 MODEL_NAMES = {
@@ -87,7 +88,7 @@ def tune_and_fit(name, x, y, groups, strata, seed, devices, profile="comprehensi
 
     cfg = PROFILES[profile]
     n_splits = inner_folds or cfg["inner_folds"]
-    folds = make_folds(strata, groups, n_splits, seed, must_have=strata, min_par_strate=2)
+    folds = plis_groupes(strata, groups, n_splits, seed, min_par_strate=2)
     for tr, va in folds:
         if not np.array_equal(np.unique(y[tr]), classes) or not np.array_equal(np.unique(y[va]), classes):
             raise ValueError(f"{name}: inner folds must contain every class; reduce inner folds.")

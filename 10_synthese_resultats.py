@@ -7,7 +7,7 @@ Sortie  : sorties/10_synthese/<date>/
     synthese.csv           une ligne par tâche × harmonisation × modèle :
                            moyenne ± écart-type sur les répétitions (exactitude équilibrée, AUC,
                            F1 macro, Brier) et IC 95 % bootstrap (rééchantillonnage des sujets,
-                           probabilités moyennées sur les répétitions)
+                           probabilités moyennées sur les répétitions, sur test ou hors pli selon la source)
     comparaisons.csv       différence d'exactitude équilibrée avec la régression logistique de la
                            même tâche (IC 95 % bootstrap apparié, part des tirages > 0)
     metriques_par_classe.csv précision, rappel, spécificité, F1 et IC bootstrap du rappel
@@ -39,11 +39,14 @@ SOURCES = {"binaire": "05_classification_binaire", "multiclasse": "06_classifica
 
 
 def lire_predictions(dossier, source):
-    path = Path(dossier) / "predictions_hors_pli.csv"
+    path = Path(dossier) / "predictions_test.csv"
+    if not path.exists():
+        path = Path(dossier) / "predictions_hors_pli.csv"
     if not path.exists():
         return None
     df = pd.read_csv(path)
     df["source"] = source
+    df["validation"] = "test_80_20" if path.name == "predictions_test.csv" else "validation_croisee"
     if "harmonisation" not in df:
         df["harmonisation"] = "aucune"
     return df
@@ -58,7 +61,7 @@ def colonnes_proba(df):
 
 
 def moyenne_repetitions(g, cols):
-    """Probabilités hors pli moyennées sur les répétitions, une ligne par sujet."""
+    """Probabilités moyennées sur les répétitions, une ligne par sujet."""
     agg = g.groupby("subject_id").agg(classe=("classe", "first"), groupe=("groupe", "first"),
                                       **{c: (c, "mean") for c in cols})
     return agg
@@ -121,9 +124,14 @@ def main():
     p.add_argument("--graine", type=int, default=GRAINE)
     p.add_argument("--reference", default="regression_logistique", help="Modèle de comparaison.")
     args = p.parse_args()
+    def dernier_resultat(etape):
+        candidats = [dernier_dossier(etape, contient=nom)
+                     for nom in ("predictions_test.csv", "predictions_hors_pli.csv")]
+        return max((p for p in candidats if p is not None), default=None)
+
     dossiers = {
-        "binaire": args.binaire or dernier_dossier("binaire", contient="predictions_hors_pli.csv"),
-        "multiclasse": args.multiclasse or dernier_dossier("multiclasse", contient="predictions_hors_pli.csv"),
+        "binaire": args.binaire or dernier_resultat("binaire"),
+        "multiclasse": args.multiclasse or dernier_resultat("multiclasse"),
         "profond": None if args.sans_profond else args.profond or dernier_dossier("profond", contient="predictions_hors_pli.csv"),
     }
     entete("SYNTHÈSE DES RÉSULTATS")
@@ -135,12 +143,13 @@ def main():
         df = lire_predictions(d, src)
         if df is None:
             continue
-        log(f"  {src:<12s} {d}")
+        log(f"  {src:<12s} {d} ({df['validation'].iloc[0]})")
         frames.append(df)
     if not frames:
         p.exit(1, "Aucun fichier de prédictions trouvé.\n")
     out = nouveau_dossier("synthese")
-    notes = []
+    notes = ["Les résultats test 80/20 portent sur les mêmes sujets test pour toutes les répétitions ; "
+             "la sélection du meilleur modèle sur ce test rend sa performance optimiste."]
     if dossiers["binaire"] is not None:
         path_ablation = Path(dossiers["binaire"]) / "ablation.csv"
         if path_ablation.is_file():
@@ -159,7 +168,8 @@ def main():
             p.exit(1, f"Colonnes SHAP manquantes : {sorted(needed - set(shap.columns))}\n")
         shap.sort_values("shap_abs_moyen", ascending=False).groupby(
             ["tache", "classe"], sort=False).head(10).to_csv(out / "shap_principales.csv", index=False)
-        notes.append(f"Principales variables SHAP hors pli : voir shap_principales.csv (source : {interpretation}).")
+        notes.append(f"SHAP de 09 : modèles distincts sur données agrégées par sujet, pas les modèles "
+                     f"sur fenêtres de 05/06 ; peut inclure leurs sujets test (source : {interpretation}).")
     else:
         log("  SHAP absent : lancer 09 avec --shap.")
     rows, comps, figures, classes_rows = [], [], [], []
@@ -193,7 +203,8 @@ def main():
                                          precision=tp / (tp + fp) if tp + fp else np.nan,
                                          specificite=tn / (tn + fp) if tn + fp else np.nan,
                                          f1=2 * tp / (2 * tp + fp + fn) if 2 * tp + fp + fn else np.nan))
-            rows.append(dict(source=g["source"].iloc[0], tache=tache, harmonisation=harm, modele=modele,
+            rows.append(dict(source=g["source"].iloc[0], validation=g["validation"].iloc[0],
+                             tache=tache, harmonisation=harm, modele=modele,
                              n_sujets=len(y), n_repetitions=int(g["repetition"].nunique()),
                              exactitude_equilibree=per_rep["exactitude_equilibree"].mean(),
                              exactitude_equilibree_std=per_rep["exactitude_equilibree"].std(ddof=1),
@@ -249,7 +260,7 @@ def main():
     (out / "synthese.md").write_text(
         "# Synthèse des résultats\n\nMoyenne ± écart-type sur les répétitions ; IC 95 % bootstrap par sujet "
         "(probabilités moyennées sur les répétitions). Les métriques par classe et leurs IC de rappel "
-        "sont dans metriques_par_classe.csv. Les IC conditionnent sur les prédictions hors pli disponibles "
+        "sont dans metriques_par_classe.csv. Les IC conditionnent sur les prédictions disponibles "
         "et ne comprennent pas toute l'incertitude d'entraînement ou de sélection du modèle.\n\n"
         "La base et le trouble sont confondus en multiclasse : l'harmonisation ne démontre pas une "
         "généralisation clinique. Les étiquettes d'anxiété proviennent du dépistage GAD-7. "
@@ -258,7 +269,7 @@ def main():
         "\n".join(lignes) + "\n", encoding="utf-8")
     try:
         tex = table.to_latex(index=False, float_format="%.3f", escape=True,
-                             caption="Performances hors pli (moyenne $\\pm$ écart-type ; IC 95~\\% bootstrap par sujet).",
+                             caption="Performances test ou hors pli selon la source (moyenne $\\pm$ écart-type ; IC 95~\\% bootstrap par groupe).",
                              label="tab:synthese")
         (out / "synthese.tex").write_text(tex, encoding="utf-8")
     except ImportError as exc:   # pandas >= 2 : to_latex exige jinja2

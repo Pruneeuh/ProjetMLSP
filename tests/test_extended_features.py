@@ -265,9 +265,8 @@ class ExtendedFeatureTests(unittest.TestCase):
                 pipeline.main()
             self.assertEqual(result.exception.code, 0)
             self.assertEqual([Path(c[1]).name[:2] for c in commands], ["05", "06"])
-            for base, path in zip(BASES, paths[3]):
-                self.assertEqual(commands[0][commands[0].index(f"--{base}") + 1], str(path))
-            self.assertEqual(commands[1][commands[1].index("--fusion") + 1], str(paths[4][0]))
+            for command in commands:
+                self.assertEqual(command[command.index("--fusion") + 1], str(paths[4][0]))
 
     def test_pipeline_recalculer_bypasses_cache(self):
         class FakeProcess:
@@ -421,15 +420,16 @@ class ExtendedFeatureTests(unittest.TestCase):
                     for i in range(6):
                         sid = f"{base}_{label}_{i}"
                         records.append(dict(subject_id=sid, group_validation=sid, label=label, statut="extrait"))
-                        for channel in ["F7", "F3", "F4", "F8"]:
-                            for band in BANDS:
-                                row = dict(dataset=base, subject_id=sid, group_validation=sid, label=label,
-                                           channel=channel, band=band, window=0, sd_before_standardization=1.0)
-                                row.update({name: label + i / 10 + base_index / 100 + j / 1000
-                                            for j, name in enumerate(MEASURES + MESURES_ETENDUES + PUISSANCES)})
-                                row.update({name: label + i / 10 + j / 1000 if band == BANDS[0] else np.nan
-                                            for j, name in enumerate(MULTIECHELLE)})
-                                rows.append(row)
+                        for window in (0, 1):
+                            for channel in ["F7", "F3", "F4", "F8"]:
+                                for band in BANDS:
+                                    row = dict(dataset=base, subject_id=sid, group_validation=sid, label=label,
+                                               channel=channel, band=band, window=window, sd_before_standardization=1.0)
+                                    row.update({name: label + i / 10 + base_index / 100 + j / 1000 + window / 100
+                                                for j, name in enumerate(MEASURES + MESURES_ETENDUES + PUISSANCES)})
+                                    row.update({name: label + i / 10 + j / 1000 if band == BANDS[0] else np.nan
+                                                for j, name in enumerate(MULTIECHELLE)})
+                                    rows.append(row)
                 pd.DataFrame(records).to_csv(run / "audit_enregistrements.csv", index=False)
                 pd.DataFrame(rows).to_csv(run / "features_windows.csv", index=False)
 
@@ -447,36 +447,59 @@ class ExtendedFeatureTests(unittest.TestCase):
                 fusion.main()
             self.assertEqual(pd.read_csv(fused / "entropies_etendues_sujets.csv").shape[1], 61)
             self.assertEqual(pd.read_csv(fused / "puissances_sujets.csv").shape[1], 41)
+            split = pd.read_csv(fused / "partition_sujets.csv")
+            windows = pd.read_csv(fused / "fenetres_communes.csv")
+            self.assertEqual(len(windows), 2 * len(split))
+            self.assertEqual(windows.groupby("subject_id").window.nunique().min(), 2)
+            self.assertFalse(set(split.loc[split.partition == "train", "groupe"]) &
+                             set(split.loc[split.partition == "test", "groupe"]))
+            self.assertTrue(split.groupby(["base", "label_binaire", "partition"]).size().ge(1).all())
 
             binary_folds, multiclass_folds = [], []
             for feature_set, count in (("classiques", 100), ("etendues", 240), ("etendues_puissances", 280)):
                 bout = root / f"binary_{feature_set}"
                 bout.mkdir()
                 selection = [] if feature_set == "etendues_puissances" else ["--caracteristiques", feature_set]
-                argv = ["05", "--bases", "depression", "--depression", str(runs["depression"]),
+                diagnostics = ["--ablation", "--permutations", "1"] if feature_set == "classiques" else []
+                argv = ["05", "--bases", "depression", "--fusion", str(fused),
                         "--modeles", "regression_logistique", "--sans-reference-amplitude",
-                        "--plis", "3", "--repetitions", "1", *selection, "--sans-tuning", "--cpu"]
-                with patch.object(sys, "argv", argv), patch.object(binary, "nouveau_dossier", return_value=bout):
+                        "--plis", "3", "--repetitions", "1", *selection, *diagnostics, "--sans-tuning", "--cpu"]
+                with patch.object(sys, "argv", argv), patch.object(binary, "nouveau_dossier", return_value=bout), \
+                     patch.object(binary, "tune_and_fit", wraps=binary.tune_and_fit) as tune:
                     binary.main()
+                depression_windows = pd.read_csv(fused / "fenetres_depression.csv")
+                first_feature = f"F7|{BANDS[0]}|{MEASURES[0]}"
+                expected_train = set(depression_windows.loc[depression_windows.partition.eq("train"), first_feature])
+                actual_train = set(tune.call_args_list[0][0][1][:, 0])
+                np.testing.assert_allclose(sorted(actual_train), sorted(expected_train))
                 result = pd.read_csv(bout / "metriques_par_repetition.csv")
                 self.assertEqual(int(result.iloc[0]["n_variables"]), count)
                 bpreds = synthesis.lire_predictions(bout, "binaire")
                 self.assertEqual(synthesis.colonnes_proba(bpreds), ["proba_temoin", "proba_trouble"])
-                binary_folds.append(pd.read_csv(bout / "predictions_hors_pli.csv")
+                binary_folds.append(pd.read_csv(bout / "predictions_test.csv")
                                     .set_index("subject_id")["pli"].sort_index())
+                self.assertEqual(set(bpreds.subject_id), set(split.loc[(split.base == "depression") &
+                                                                       (split.partition == "test"), "subject_id"]))
+                if diagnostics:
+                    self.assertTrue((bout / "ablation.csv").is_file())
+                    self.assertTrue((bout / "permutations.csv").is_file())
 
                 mout = root / f"multiclass_{feature_set}"
                 mout.mkdir()
+                lodo = [] if feature_set == "etendues_puissances" else ["--sans-lodo"]
                 argv = ["06", "--fusion", str(fused), "--modeles", "regression_logistique",
                         "--harmonisations", "zscore", "--plis", "3", "--repetitions", "1",
-                        "--sans-permutations", "--sans-lodo", "--sans-tuning", "--cpu", *selection]
+                        "--sans-permutations", *lodo, "--sans-tuning", "--cpu", *selection]
                 with patch.object(sys, "argv", argv), patch.object(multiclass, "nouveau_dossier", return_value=mout):
                     multiclass.main()
                 result = pd.read_csv(mout / "multiclasse_metriques.csv")
                 selected = result[(result.modele == "regression_logistique") & (result.harmonisation == "aucune")]
                 self.assertEqual(int(selected.iloc[0]["nombre_variables"]), count)
                 self.assertTrue((mout / "controle_site_resume.csv").exists())
-                predictions = pd.read_csv(mout / "predictions_hors_pli.csv")
+                if not lodo:
+                    self.assertTrue((mout / "lodo_resume.csv").is_file())
+                predictions = pd.read_csv(mout / "predictions_test.csv")
+                self.assertEqual(set(predictions.subject_id), set(split.loc[split.partition == "test", "subject_id"]))
                 mpreds = synthesis.lire_predictions(mout, "multiclasse")
                 self.assertEqual(len(synthesis.colonnes_proba(mpreds)), 4)
                 multiclass_folds.append(predictions[(predictions.modele == "regression_logistique") &
@@ -488,6 +511,15 @@ class ExtendedFeatureTests(unittest.TestCase):
                 pd.testing.assert_series_equal(binary_folds[0], folds)
             for folds in multiclass_folds[1:]:
                 pd.testing.assert_series_equal(multiclass_folds[0], folds)
+
+            sout = root / "summary_holdout"
+            sout.mkdir()
+            argv = ["10", "--binaire", str(bout), "--multiclasse", str(mout),
+                    "--sans-profond", "--bootstrap", "20"]
+            with patch.object(sys, "argv", argv), patch.object(synthesis, "nouveau_dossier", return_value=sout), \
+                 patch.object(synthesis, "dernier_dossier", return_value=None):
+                synthesis.main()
+            self.assertEqual(set(pd.read_csv(sout / "synthese.csv").validation), {"test_80_20"})
 
             for run in runs.values():
                 path = run / "features_windows.csv"

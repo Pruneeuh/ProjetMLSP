@@ -9,12 +9,12 @@ par défaut la sortie **la plus récente** de l'étape précédente dans `sortie
 | 01 | `01_chargement_donnees.py` | lecture EDF / .eea / .mat, µV, doublons (SHA), groupes de validation | `sorties/01_donnees/` |
 | 02 | `02_controle_qualite.py` | contrôle des signaux, filtrage 0,5–45 Hz, rééchantillonnage à 128 Hz et confusions d'acquisition | `sorties/02_controle_qualite/<date>/` |
 | 03 | `03_extraction_entropies.py` | fenêtres 10 s, DWT, entropies et énergies, RCMSE/RCMPE large bande | `sorties/03_extraction/<base>_*/features_windows.csv` |
-| 04 | `04_fusion_harmonisation.py` | 10 canaux communs, 4 classes, diagnostic de l'effet de site (η², ACP) | `sorties/04_fusion/` |
+| 04 | `04_fusion_harmonisation.py` | fenêtres fusionnées, partition groupée 80/20, diagnostic descriptif de l'effet de site (η², ACP) | `sorties/04_fusion/` |
 | 05 | `05_classification_binaire.py` | trouble / témoins par base : RL, MLP, SVM, kNN, forêt, LDA, XGBoost, LightGBM, références et recherche imbriquée | `sorties/05_binaire/` |
 | 06 | `06_classification_multiclasse.py` | 4 classes × 4 harmonisations dans les plis, contrôles de site, permutations facultatives, leave-one-dataset-out | `sorties/06_multiclasse/` |
 | 07 | `07_reseaux_neurones.py` | CNN 1D, CNN+attention, EEGNet adapté, FT-Transformer, TabM (binaire et 4 classes) | `sorties/07_reseaux_neurones/` |
 | 08 | `08_statistiques_groupes.py` | Mann-Whitney + FDR, δ de Cliff, g de Hedges, similarité des signatures entre troubles | `sorties/08_statistiques/` |
-| 09 | `09_interpretabilite.py` | importance par permutation de groupes, coefficients RL, SHAP sur les sujets hors pli | `sorties/09_interpretabilite/` |
+| 09 | `09_interpretabilite.py` | interprétation de modèles distincts sur caractéristiques agrégées par sujet | `sorties/09_interpretabilite/` |
 | 10 | `10_synthese_resultats.py` | IC 95 %, métriques par classe, Brier, calibration et comparaisons appariées | `sorties/10_synthese/` |
 
 L'étape 01 exclut `387-02w1` par précaution et conserve `387-03w1` lorsqu'il est
@@ -164,15 +164,15 @@ python 04_fusion_harmonisation.py --sans-caracteristiques-etendues \
     --depression 04_extraction_corrigee/depression_20261122_185618_080052 \
     --schizophrenie 04_extraction_corrigee/schizophrenie_20261123_193938_456160 \
     --anxiete 04_extraction_corrigee/anxiete_20261123_215357_170531
-python 05_classification_binaire.py --caracteristiques classiques --depression ... --schizophrenie ... --anxiete ...
+python 05_classification_binaire.py --caracteristiques classiques --fusion sorties/04_fusion/<date>
 python 06_classification_multiclasse.py --caracteristiques classiques
 ```
 
 ## Caractéristiques et comparaisons
 
 L'étape 03 calcule toujours ApEn, PermEn, Shannon d'amplitude, les énergies DWT et
-RCMSE/RCMPE par canal sur le signal filtré, aux échelles 1 à 10. Les fenêtres sont
-agrégées par participant ; `features_sujets.csv` contient leur moyenne. RCMSE utilise
+RCMSE/RCMPE par canal sur le signal filtré, aux échelles 1 à 10. `features_sujets.csv`
+contient leur moyenne par participant ; les modèles 05/06 utilisent les fenêtres. RCMSE utilise
 m=2 et r=0,15 écart-type du signal de la fenêtre ; RCMPE utilise m=4 et le logarithme
 naturel. Les mesures large bande figurent uniquement sur les lignes A4 du fichier long,
 mais ne sont **pas** des caractéristiques A4 ; la fusion les étiquette `large_bande`.
@@ -199,19 +199,27 @@ python 06_classification_multiclasse.py --caracteristiques etendues
 python 06_classification_multiclasse.py --caracteristiques etendues_puissances
 ```
 
-Utiliser les mêmes dossiers d'extraction/fusion, modèles, plis, répétitions et graines dans les
-deux exécutions pour comparer les caractéristiques sur les mêmes partitions ; choisir les
-dossiers explicitement avec `--depression`, `--schizophrenie`, `--anxiete` et `--fusion` si
-nécessaire. `etendues` ajoute les trois mesures et les entropies multiéchelles aux cinq mesures classiques ;
+Utiliser le même dossier de fusion et les mêmes modèles et graines dans les deux exécutions.
+Choisir les extractions en 04 avec `--depression`, `--schizophrenie`, `--anxiete`, puis le même
+dossier `--fusion` en 05 et 06. `etendues` ajoute les trois mesures et les entropies multiéchelles aux cinq mesures classiques ;
 `etendues_puissances` ajoute en plus LogPower et RelPower. Les anciens dossiers restent
 utilisables en mode `classiques` ; les options étendues exigent de nouvelles extractions.
 Dans certains résultats, l'étiquette historique `entropies` désigne le jeu sélectionné :
 avec le réglage par défaut, il contient aussi les puissances. La référence d'amplitude est
 un modèle distinct.
 
-Les étapes 05 et 06 continuent à moyenner les caractéristiques par participant avant
-l'entraînement : elles ne reproduisent pas l'entraînement par fenêtre du notebook. Le
-rééchantillonnage à 128 Hz et les unités µV sont conservés. LogPower est log10 de l'énergie
+04 enregistre une partition stratifiée par base et étiquette, au niveau des groupes de validation :
+environ 80 % des groupes pour l'entraînement et 20 % pour le test (les effectifs entiers peuvent
+modifier légèrement le rapport). Tous les enregistrements et fenêtres d'un groupe restent ensemble.
+05 utilise les canaux de chaque base, 06 les canaux communs ; les deux entraînent sur les fenêtres
+train et calculent les métriques sur les probabilités test moyennées par participant.
+Les répétitions réajustent les modèles avec des graines différentes sur **le même test** : leur
+écart-type n'est pas une variabilité entre partitions. Ablations, contrôles de site, permutations
+et LODO utilisent uniquement train. 04 conserve des matrices par sujet pour les analyses descriptives
+et les étapes 07–09 ; ses harmonisations descriptives ne servent pas à 05/06.
+Les caractéristiques et le réglage ne sont pas strictement identiques au notebook : notamment,
+les fenêtres ne sont pas pondérées inversement au nombre de fenêtres par participant, contrairement
+à son analyse fusionnée. Le rééchantillonnage à 128 Hz et les unités µV sont conservés. LogPower est log10 de l'énergie
 DWT en µV², et non une puissance moyenne ; RelPower est la fraction de l'énergie des cinq
 composantes. Les résultats peuvent donc différer du notebook. Les puissances peuvent également
 capturer des différences de site ; examiner les contrôles de site et les références d'amplitude.
@@ -221,8 +229,9 @@ capturer des différences de site ; examiner les contrôles de site et les réf�
 05 et 06 utilisent par défaut une recherche aléatoire **imbriquée et groupée par sujet** pour
 la régression logistique, le MLP, le SVM, kNN, la forêt, LDA, XGBoost et LightGBM. La sélection
 de variables est ajustée dans chaque pli interne ; 06 y réajuste aussi l'harmonisation sur les
-seuls témoins internes d'entraînement. Le score de recherche est l'exactitude équilibrée par
-participant. La référence majoritaire n'est pas réglée. Les modèles et espaces de recherche
+seuls témoins internes d'entraînement. Le score de recherche est l'exactitude équilibrée des
+fenêtres de validation interne ; seules les métriques test sont moyennées par participant.
+La référence majoritaire n'est pas réglée. Les modèles et espaces de recherche
 s'appuient sur `model_tuning.py`, avec adaptation à la classification multiclasse.
 
 Le profil `comprehensive` par défaut utilise 4 plis internes et 40 candidats (25 pour les arbres)
@@ -247,9 +256,10 @@ ne garantit pas qu'un grand entraînement tienne en mémoire. Les permutations d
 désactivées par défaut ; `--permutations N` les active et répète toute la recherche pour chaque
 permutation. Elles peuvent donc être particulièrement coûteuses.
 
-09 retune le modèle choisi dans chaque pli et explique des participants hors pli (`--shap`).
-Pour comparer à 05/06, utiliser les mêmes données, caractéristiques, modèle, plis, graines,
-profil et harmonisation. `shap_par_pli.csv` et `shap_valeurs.csv` présentent les valeurs absolues
+09 retune un modèle **différent**, entraîné sur les caractéristiques agrégées par sujet, et explique
+des participants hors pli (`--shap`). Son CV utilise tous les sujets, y compris les sujets test de
+04 : ses explications ne sont pas celles des modèles sur fenêtres de 05/06 et ne doivent pas servir
+à sélectionner des variables pour évaluer ce même test. `shap_par_pli.csv` et `shap_valeurs.csv` présentent les valeurs absolues
 par classe et variable ; les variables non sélectionnées reçoivent zéro dans le pli concerné.
 09 prend en charge les harmonisations `zscore` et `aucune` ; CORAL et le filtrage ne conservent
 pas directement les mêmes variables d'un pli à l'autre.
