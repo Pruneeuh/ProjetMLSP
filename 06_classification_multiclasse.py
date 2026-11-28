@@ -11,8 +11,9 @@ Sortie  : sorties/06_multiclasse/<date>/
 
   1. Harmonisation (--harmonisations zscore filtrage coral filtrage_coral), toujours ajustée DANS
      chaque pli sur les seuls témoins d'entraînement ; « aucune » sert de référence.
-  2. Modèles : référence majoritaire, régression logistique multinomiale L2 (classes pondérées),
-     MLP, XGBoost (--xgboost), SVM / forêt (--modeles), référence amplitude (log écart-type).
+  2. Modèles : référence majoritaire, régression logistique, MLP, SVM, kNN, forêt, LDA,
+     XGBoost, LightGBM, référence amplitude (log écart-type).
+     Recherche imbriquée groupée par défaut ; --sans-tuning pour la désactiver.
   3. Évaluation : StratifiedGroupKFold par sujet (strates = base × étiquette), --repetitions fois ;
      exactitude équilibrée, F1 macro, AUC un-contre-tous, Brier, rappel par classe, part des
      témoins de chaque base reconnus comme témoins.
@@ -30,15 +31,18 @@ Sortie  : sorties/06_multiclasse/<date>/
 
 Usage :
     python 06_classification_multiclasse.py
-    python 06_classification_multiclasse.py --xgboost --permutations 200
+    python 06_classification_multiclasse.py --profil-tuning quick --permutations 200
     python 06_classification_multiclasse.py --harmonisations zscore coral --coral-composantes 10
     python 06_classification_multiclasse.py --sans-permutations --sans-lodo --repetitions 3   # rapide
+    python 06_classification_multiclasse.py --caracteristiques etendues_puissances
 
-Dépendances : pip install numpy pandas scikit-learn matplotlib   (+ xgboost en option)
+Dépendances : numpy pandas scipy scikit-learn matplotlib xgboost lightgbm
 """
 import argparse
 import time
 from pathlib import Path
+
+from eeg_tuning import detect_devices, predict_proba, tune_and_fit
 
 import numpy as np
 import pandas as pd
@@ -46,30 +50,36 @@ from sklearn.metrics import confusion_matrix, recall_score
 
 import eeg_harmonisation as eh
 from eeg_config import BASES, CLASS_OF_BASE, CLASSES, GRAINE
-from eeg_donnees import charger_fusion
-from eeg_utils import (Compteur, arguments_dict, ecrire_json, entete, fit_predict, fmt_table, log, make_folds,
+from eeg_donnees import caracteristiques_fusion, charger_fusion
+from eeg_utils import (Compteur, arguments_dict, ecrire_json, entete, fmt_table, log, make_folds,
                        multiclass_scores, nouveau_dossier, p_valeur_permutation, plot_confusion, plt_agg,
                        summarise, versions, xgboost_disponible)
 
 
-class Ctx:
-    """Réglages des modèles (remplis depuis args)."""
-    c = 1.0
-    mlp_couches = (16,)
-    mlp_alpha = 1.0
+def tuned_model(nom, x, y, groups, strata, bases, ref, method, seed, args):
+    return tune_and_fit(nom, x, y, groups, strata, seed, args.devices, args.profil_tuning,
+                        args.plis_internes, args.tirages_tuning, bases=bases, reference=ref,
+                        harmonisation=method, enabled=not args.sans_tuning, fixed_c=args.c,
+                        fixed_mlp_layers=args.mlp_couches, fixed_mlp_alpha=args.mlp_alpha)
 
 
-def fp(nom, seed, x_tr, y_tr, x_te, n):
-    return fit_predict(nom, seed, x_tr, y_tr, x_te, n, Ctx.c, Ctx.mlp_couches, Ctx.mlp_alpha)[0]
-
-
-def cross_val_proba(y, folds, prepared, nom, n_classes, seed):
+def cross_val_proba(y, folds, x, bases, ref, groups, strata, method, nom, n_classes, seed, args,
+                    tuning=None, context=None):
     proba = np.zeros((len(y), n_classes))
     fold_id = np.zeros(len(y), dtype=int)
-    for k, ((tr, te), (x_tr, x_te)) in enumerate(zip(folds, prepared), 1):
-        proba[te] = fp(nom, seed, x_tr, y[tr], x_te, n_classes)
+    n_variables = None
+    for k, (tr, te) in enumerate(folds, 1):
+        model, result = tuned_model(nom, x[tr], y[tr], groups[tr], strata[tr],
+                                    bases[tr], ref[tr], method, seed, args)
+        x_tr, x_te = eh.harmonise(x[tr], x[te], bases[tr], bases[te], ref[tr], method)
+        model.fit(x_tr, y[tr])
+        proba[te] = predict_proba(model, x_te, n_classes)
         fold_id[te] = k
-    return proba, fold_id
+        if n_variables is None:
+            n_variables = x_tr.shape[1]
+        if tuning is not None and result["best_params"]:
+            tuning.append({**context, "pli": k, **result})
+    return proba, fold_id, n_variables
 
 
 def spec_id(spec):
@@ -81,7 +91,7 @@ def strates(meta):
 
 
 # --------------------------------------------------------------------------- analyses
-def main_analysis(x_by_feat, meta, args, specs):
+def main_analysis(x_by_feat, meta, args, specs, tuning):
     y = meta["classe"].to_numpy()
     bases = meta["base"].to_numpy()
     groups = meta["groupe"].to_numpy()
@@ -96,19 +106,19 @@ def main_analysis(x_by_feat, meta, args, specs):
     for rep in range(args.repetitions):
         seed = args.graine + rep
         folds = make_folds(strata, groups, args.plis, seed, must_have=strata)
-        cache = {}
         for spec in specs:
             t0 = time.time()
             key = (spec["caracteristiques"], spec["harmonisation"])
-            if key not in cache:
-                cache[key] = eh.prepare_folds(x_by_feat[key[0]], bases, ref, folds, key[1])
-            proba, fold_id = cross_val_proba(y, folds, cache[key], spec["kind"], len(CLASSES), seed)
+            proba, fold_id, n_variables = cross_val_proba(
+                y, folds, x_by_feat[key[0]], bases, ref, groups, strata, key[1], spec["kind"],
+                len(CLASSES), seed, args, tuning,
+                dict(tache="multiclasse", modele=spec["modele"], harmonisation=key[1], repetition=rep + 1))
             row, pred = multiclass_scores(y, proba, labels)
             for c, cname in enumerate(CLASSES):
                 row[f"rappel_{cname}"] = recall_score(y == c, pred == c, zero_division=0)
             for b in BASES:
                 row[f"temoins_{b}_bien_classes"] = float(np.mean(pred[temoin_base == b] == 0))
-            row["nombre_variables"] = cache[key][0][0].shape[1]
+            row["nombre_variables"] = n_variables
             rows.append(dict(tache="multiclasse", modele=spec["modele"], harmonisation=spec["harmonisation"],
                              repetition=rep + 1, **row))
             sid = spec_id(spec)
@@ -143,9 +153,9 @@ def site_controls(x_by_feat, meta, args, kinds):
             folds = make_folds(strata, groups, args.plis, seed, must_have=strata)
             for feat in ["entropies", "amplitude"]:
                 for method in methods:
-                    prepared = eh.prepare_folds(x_by_feat[feat][mask], bases, ref, folds, method)
                     for kind in kinds:
-                        proba, _ = cross_val_proba(y, folds, prepared, kind, len(BASES), seed)
+                        proba, _, _ = cross_val_proba(y, folds, x_by_feat[feat][mask], bases, ref,
+                                                      groups, strata, method, kind, len(BASES), seed, args)
                         row, _ = multiclass_scores(y, proba, list(range(len(BASES))))
                         rows.append(dict(population=population, caracteristiques=feat, harmonisation=method,
                                          modele=kind, repetition=rep + 1, **row))
@@ -182,23 +192,32 @@ def permutation_tests(x_by_feat, meta, args, observed, specs):
             scores = []
             for i in range(args.permutations):
                 classe, lab = permute_labels(meta, rng, mode)
-                seed = args.graine + 10_000 + i
-                try:
-                    folds = make_folds(base_codes * 2 + lab, groups, args.plis, seed)
-                    prepared = eh.prepare_folds(x_by_feat[spec["caracteristiques"]], bases, classe == 0, folds,
-                                                spec["harmonisation"])
-                    proba, _ = cross_val_proba(classe, folds, prepared, spec["kind"], len(CLASSES), seed)
-                except ValueError as exc:
-                    log(f"    permutation {i + 1} ignorée : {exc}")
+                repeat_scores = []
+                for rep in range(args.repetitions):
+                    seed = args.graine + rep
+                    strata = base_codes * 2 + lab
+                    try:
+                        folds = make_folds(strata, groups, args.plis, seed)
+                    except ValueError as exc:
+                        log(f"    permutation {i + 1} ignorée : {exc}")
+                        break
+                    proba, _, _ = cross_val_proba(
+                        classe, folds, x_by_feat[spec["caracteristiques"]], bases, classe == 0,
+                        groups, strata, spec["harmonisation"], spec["kind"], len(CLASSES), seed, args)
+                    repeat_scores.append(multiclass_scores(classe, proba, labels)[0])
+                if len(repeat_scores) != args.repetitions:
                     continue
-                scores.append(multiclass_scores(classe, proba, labels)[0])
+                scores.append(pd.DataFrame(repeat_scores).mean().to_dict())
+            if not scores:
+                raise ValueError(f"{spec['modele']} [{spec['harmonisation']}] : aucune permutation valide ({mode}).")
             perm = pd.DataFrame(scores)
             obs = observed.loc[(observed["modele"] == spec["modele"]) & (observed["harmonisation"] == spec["harmonisation"])]
             for metric in ["exactitude_equilibree", "f1_macro"]:
                 o = obs[metric].mean()
                 null = perm[metric].to_numpy()
                 rows.append(dict(modele=spec["modele"], harmonisation=spec["harmonisation"], permutation=mode,
-                                 metrique=metric, observe=o, moyenne_nulle=null.mean(), ecart_type_nul=null.std(ddof=1),
+                                 metrique=metric, observe=o, moyenne_nulle=null.mean(),
+                                 ecart_type_nul=null.std(ddof=1) if len(null) > 1 else np.nan,
                                  quantile_95_nul=np.quantile(null, 0.95), gain_sur_nul=o - null.mean(),
                                  p_valeur=p_valeur_permutation(o, null), n_permutations=len(null)))
             log(f"  {spec['modele']} [{spec['harmonisation']}] / {mode} : {len(perm)} permutations ({time.time() - t0:.0f} s)")
@@ -236,7 +255,10 @@ def lodo(x_by_feat, meta, args, specs):
                         cache[key] = eh.harmonise(x[tr], x[te], bases[tr], bases[te], ref_tr, key[1],
                                                   ref_te_stats={test_base: x[ref_test]})
                     x_tr, x_te = cache[key]
-                    proba = fp(spec["kind"], seed, x_tr, y[tr], x_te, 2)
+                    model, _ = tuned_model(spec["kind"], x_by_feat[key[0]][tr], y[tr], groups[tr],
+                                           strates(meta)[tr], bases[tr], ref_tr, key[1], seed, args)
+                    model.fit(x_tr, y[tr])
+                    proba = predict_proba(model, x_te, 2)
                     row, pred = multiclass_scores(y[te], proba, [0, 1])
                     row["sensibilite"] = recall_score(y[te], pred, zero_division=0)
                     row["specificite"] = recall_score(y[te], pred, pos_label=0, zero_division=0)
@@ -297,19 +319,27 @@ def plot_site_controls(site_summary, out):
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--fusion", type=Path, default=None, help="Dossier de 04_fusion (défaut : le plus récent).")
+    p.add_argument("--caracteristiques", choices=["classiques", "etendues", "etendues_puissances"],
+                   default="classiques", help="Jeu de variables ; les jeux étendus exigent l'option correspondante en 04.")
     p.add_argument("--harmonisations", nargs="+", choices=eh.HARMONISATIONS, default=eh.HARMONISATIONS)
-    p.add_argument("--modeles", nargs="+", default=["regression_logistique", "mlp"],
-                   choices=["regression_logistique", "mlp", "svm_rbf", "foret_aleatoire", "lda", "xgboost"])
+    modeles = ["regression_logistique", "mlp", "svm", "svm_rbf", "knn",
+               "foret_aleatoire", "lda", "xgboost", "lightgbm"]
+    p.add_argument("--modeles", nargs="+", default=[m for m in modeles if m != "svm_rbf"], choices=modeles)
     p.add_argument("--xgboost", action="store_true", help="Ajouter XGBoost (paquet xgboost requis).")
+    p.add_argument("--sans-tuning", action="store_true", help="Désactiver la recherche imbriquée.")
+    p.add_argument("--profil-tuning", choices=["quick", "comprehensive"], default="comprehensive")
+    p.add_argument("--plis-internes", type=int, default=None)
+    p.add_argument("--tirages-tuning", type=int, default=None)
+    p.add_argument("--cpu", action="store_true", help="Désactiver les sondes GPU et utiliser le CPU.")
     p.add_argument("--coral-composantes", type=int, default=20)
     p.add_argument("--filtrage-fraction", type=float, default=0.5)
     p.add_argument("--filtrage-arbres", type=int, default=200)
     p.add_argument("--plis", type=int, default=5)
     p.add_argument("--repetitions", type=int, default=10)
-    p.add_argument("--permutations", type=int, default=100)
+    p.add_argument("--permutations", type=int, default=0,
+                   help="Nombre de permutations ; chacune répète la recherche imbriquée.")
     p.add_argument("--permutation-modeles", nargs="+", default=["regression_logistique"],
-                   choices=["regression_logistique", "mlp", "svm_rbf", "foret_aleatoire", "lda", "xgboost",
-                            "reference_amplitude"])
+                   choices=modeles + ["reference_amplitude"])
     p.add_argument("--graine", type=int, default=GRAINE)
     p.add_argument("--c", type=float, default=1.0)
     p.add_argument("--mlp-couches", type=int, nargs="+", default=[16])
@@ -319,21 +349,25 @@ def main():
     p.add_argument("--sans-permutations", action="store_true")
     p.add_argument("--sans-lodo", action="store_true")
     args = p.parse_args()
-    if args.plis < 2 or args.repetitions < 1 or args.permutations < 1:
-        p.error("--plis >= 2, --repetitions >= 1, --permutations >= 1.")
+    if (args.plis < 2 or args.repetitions < 1 or args.permutations < 0
+            or (args.plis_internes is not None and args.plis_internes < 2)
+            or (args.tirages_tuning is not None and args.tirages_tuning < 1)):
+        p.error("--plis >= 2, --repetitions >= 1, --permutations >= 0, --plis-internes >= 2, --tirages-tuning >= 1.")
     if not 0 < args.lodo_calibration < 1 or not 0 < args.filtrage_fraction < 1:
         p.error("--lodo-calibration et --filtrage-fraction entre 0 et 1 (exclus).")
     if args.xgboost and "xgboost" not in args.modeles:
         args.modeles.append("xgboost")
     if "xgboost" in args.modeles + args.permutation_modeles and not xgboost_disponible():
         p.error("xgboost demandé mais absent (pip install xgboost).")
+    args.devices = {"xgboost": "cpu", "lightgbm": "cpu"} if args.cpu else detect_devices(args.modeles + args.permutation_modeles)
+    log(f"Calcul : XGBoost={args.devices['xgboost']}, LightGBM={args.devices['lightgbm']}; autres modèles sur CPU.")
     args.harmonisations = list(dict.fromkeys(args.harmonisations))
     eh.configurer(args)
-    Ctx.c, Ctx.mlp_couches, Ctx.mlp_alpha = args.c, tuple(args.mlp_couches), args.mlp_alpha
 
     start = time.time()
     try:
         common, ent, amp, meta, finfo, fdir = charger_fusion(args.fusion)
+        ent = caracteristiques_fusion(common, ent, meta, fdir, args.caracteristiques)
     except (OSError, ValueError) as exc:
         p.exit(1, f"Chargement arrêté : {exc}\n")
     x_by_feat = {"entropies": ent.to_numpy(float), "amplitude": amp.to_numpy(float)}
@@ -343,7 +377,8 @@ def main():
     log(f"Canaux communs ({len(common)}) : {', '.join(common)}")
     counts = meta["classe"].value_counts().sort_index()
     log("Classes : " + ", ".join(f"{i}={CLASSES[i]} ({counts.get(i, 0)})" for i in range(len(CLASSES))))
-    log(f"Variables : {ent.shape[1]} entropies, {amp.shape[1]} amplitudes")
+    log(f"Variables : {ent.shape[1]} ({args.caracteristiques}), {amp.shape[1]} amplitudes de référence")
+    log("Dans les contrôles de site, « entropies » désigne le jeu de variables sélectionné.")
     log(f"Harmonisations : {', '.join(args.harmonisations)} (+ « aucune ») ; modèles : {', '.join(args.modeles)}")
     log(f"Validation : StratifiedGroupKFold {args.plis} plis × {args.repetitions} répétitions "
         "(strates = base × étiquette ; harmonisation ajustée dans chaque pli sur les témoins d'entraînement)")
@@ -360,13 +395,16 @@ def main():
                    harmonisation="aucune")]
     out = nouveau_dossier("multiclasse")
     figures, site_summary, perm, lodo_summary = [], None, None, None
+    tuning = []
     try:
         log("\n[1/4] Classification 4 classes")
-        metrics, preds, confusion, detail = main_analysis(x_by_feat, meta, args, specs)
+        metrics, preds, confusion, detail = main_analysis(x_by_feat, meta, args, specs, tuning)
         summary = summarise(metrics, ["tache", "harmonisation", "modele"])
         metrics.to_csv(out / "multiclasse_metriques.csv", index=False)
         summary.to_csv(out / "multiclasse_resume.csv", index=False)
         preds.to_csv(out / "predictions_hors_pli.csv", index=False)
+        if tuning:
+            pd.DataFrame(tuning).to_csv(out / "hyperparametres_par_pli.csv", index=False)
         figures += plot_confusions(confusion, detail, out)
 
         if not args.sans_controles_site:
@@ -378,9 +416,11 @@ def main():
             site_summary.to_csv(out / "controle_site_resume.csv", index=False)
             figures.append(plot_site_controls(site_summary, out))
 
-        if not args.sans_permutations:
+        if not args.sans_permutations and args.permutations:
             log(f"\n[3/4] Tests de permutation ({args.permutations} par type et par harmonisation)")
             pspecs = [s for s in specs if s["modele"] in args.permutation_modeles and s["harmonisation"] != "aucune"]
+            if not pspecs:
+                raise ValueError("Aucun modèle de permutation n'est sélectionné dans --modeles.")
             perm = permutation_tests(x_by_feat, meta, args, metrics, pspecs)
             perm.to_csv(out / "permutations.csv", index=False)
 

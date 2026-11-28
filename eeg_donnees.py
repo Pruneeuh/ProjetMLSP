@@ -14,7 +14,7 @@ import numpy as np
 import pandas as pd
 
 from eeg_config import (ALIASES, AMPLITUDE, BANDS, BASES, CANAUX, CLASS_OF_BASE, DOSSIERS, MEASURES,
-                        ORDRE_PREFERE, SORTIES)
+                        MESURES_ETENDUES, ORDRE_PREFERE, PUISSANCES, SORTIES)
 from eeg_utils import dernier_dossier, require
 
 
@@ -100,7 +100,7 @@ def charger_extraction(run, expected, orders=None, aggregation="moyenne"):
     original = sorted(sets.iloc[0], key=str)
     mapping = channel_map(expected, original, orders)
     data["canal"] = data["channel"].map(mapping)
-    for col in MEASURES + [AMPLITUDE]:
+    for col in MEASURES + [AMPLITUDE] + [c for c in MESURES_ETENDUES + PUISSANCES if c in data]:
         data[col] = pd.to_numeric(data[col], errors="raise").replace([np.inf, -np.inf], np.nan)
     data["log_sd"] = np.log(data[AMPLITUDE].where(data[AMPLITUDE] > 0))
     canaux = sorted(set(mapping.values()), key=lambda c: ORDRE_PREFERE.index(c) if c in ORDRE_PREFERE else 99)
@@ -108,16 +108,20 @@ def charger_extraction(run, expected, orders=None, aggregation="moyenne"):
                 channels=canaux, aggregation=aggregation)
 
 
-def agreger(info, canaux):
+def agreger(info, canaux, mesures=None):
     """Agrège les fenêtres par sujet. Renvoie (entropies, amplitude) : DataFrames indexés par
     subject_id, colonnes « canal|bande|mesure » (ordre canal > bande > mesure) et
     « log_sd|canal|bande »."""
+    mesures = MEASURES if mesures is None else mesures
+    missing = set(mesures) - set(info["data"].columns)
+    require(not missing, f"{info['base']} : caractéristiques absentes {sorted(missing)} ; "
+                         "relancer 03 avec --caracteristiques-etendues.")
     data = info["data"].loc[info["data"]["canal"].isin(canaux)]
     keys = ["subject_id", "canal", "band"]
     how = "mean" if info["aggregation"] == "moyenne" else "median"
-    ent = data.groupby(keys)[MEASURES].agg(how).unstack(["canal", "band"])
+    ent = data.groupby(keys)[mesures].agg(how).unstack(["canal", "band"])
     ent = ent.reorder_levels([1, 2, 0], axis=1)
-    cols = [(c, b, m) for c in canaux for b in BANDS for m in MEASURES]
+    cols = [(c, b, m) for c in canaux for b in BANDS for m in mesures]
     ent = ent.reindex(columns=pd.MultiIndex.from_tuples(cols)).reindex(info["records"].index)
     ent.columns = ["|".join(c) for c in ent.columns]
     amp = data.groupby(keys)["log_sd"].agg(how).unstack(["canal", "band"])
@@ -206,6 +210,27 @@ def charger_fusion(dossier=None):
     amp = pd.read_csv(dossier / "amplitude_sujets.csv", index_col="subject_id").reindex(meta.index)
     info = json.loads((dossier / "fusion.json").read_text(encoding="utf-8"))
     return info["canaux_communs"], ent, amp, meta, info, dossier
+
+
+def caracteristiques_fusion(common, ent, meta, dossier, choix):
+    """Ajoute les colonnes étendues demandées, avec les mêmes contrôles pour 06 et 09."""
+    if choix == "classiques":
+        return ent
+    files = [("entropies_etendues_sujets.csv", MESURES_ETENDUES)]
+    if choix == "etendues_puissances":
+        files.append(("puissances_sujets.csv", PUISSANCES))
+    for name, measures in files:
+        path = dossier / name
+        require(path.is_file(), f"{path} absent ; relancer 04 avec --caracteristiques-etendues.")
+        extra = pd.read_csv(path, index_col="subject_id")
+        require(extra.index.is_unique and set(extra.index) == set(meta.index),
+                f"{path} : sujets incohérents avec la fusion.")
+        columns = [f"{c}|{b}|{m}" for c in common for b in BANDS for m in measures]
+        require(extra.columns.is_unique and set(extra.columns) == set(columns),
+                f"{path} : colonnes de caractéristiques incohérentes avec la fusion.")
+        extra = extra[columns].apply(pd.to_numeric, errors="raise")
+        ent = pd.concat([ent, extra.reindex(meta.index)], axis=1)
+    return ent
 
 
 def forme_tenseur(colonnes):

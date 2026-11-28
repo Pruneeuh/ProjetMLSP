@@ -1,11 +1,12 @@
-"""Étape 2 : prétraitement, fenêtrage, DWT (5 bandes) et calcul des 4 entropies.
+"""Étape 2 : prétraitement, fenêtrage, DWT et calcul des caractéristiques.
 
 Entrée  : outputs/<name>_signals.npz + <name>_metadata.csv  (produits par load_eeg.py)
 Sortie  : outputs/<name>_entropy_features.csv
           une ligne par fenêtre : subject_id, label, window, puis
-          ch{XX}_{bande}_{entropie}  (canaux x 5 bandes x 4 entropies)
+          ch{XX}_{bande}_{mesure}  (canaux x 5 bandes x 9 mesures)
 
-Entropies : SampEn, DispEn, FuzzyEn, Shannon
+Mesures   : SampEn, DispEn, FuzzyEn, Shannon, ApEn, PermEn, LZC, LogPower, RelPower
+LogPower est le log10 de l'énergie DWT ; RelPower est la fraction de l'énergie des cinq bandes.
 Bandes    : delta, theta, alpha, beta, gamma (via ondelettes discrètes, db4)
 
 Usage :
@@ -130,13 +131,97 @@ def shannon_entropy(x, bins=8):
         return np.nan
 
 
+def approximate_entropy(x, m=2, r=0.2):
+    sd = x.std()
+    if sd == 0:
+        return np.nan
+    try:
+        return _last(EH.ApEn(x, m=m, r=r * sd)[0])
+    except Exception:
+        return np.nan
+
+
+def permutation_entropy(x, m=4, tau=1):
+    """Entropie de permutation normalisée (Pnorm d'EntropyHub)."""
+    try:
+        return _last(EH.PermEn(x, m=m, tau=tau)[1])
+    except Exception:
+        return np.nan
+
+
+def lempel_ziv(x):
+    """Complexité LZ76 binarisée à la médiane, normalisée par n / log2(n)."""
+    s = (x > np.median(x)).astype(np.int8).tolist()
+    n = len(s)
+    if n < 2:
+        return np.nan
+    i, k, l = 0, 1, 1
+    k_max, c = 1, 1
+    while True:
+        if s[i + k - 1] == s[l + k - 1]:
+            k += 1
+            if l + k > n:
+                c += 1
+                break
+        else:
+            k_max = max(k, k_max)
+            i += 1
+            if i == l:
+                c += 1
+                l += k_max
+                if l + 1 > n:
+                    break
+                i, k, k_max = 0, 1, 1
+            else:
+                k = 1
+    return c / (n / np.log2(n))
+
 
 ENTROPIES = {
     "SampEn": sample_entropy,
     "DispEn": dispersion_entropy,
     "FuzzyEn": fuzzy_entropy,
     "Shannon": shannon_entropy,
+    "ApEn": approximate_entropy,
+    "PermEn": permutation_entropy,
+    "LZC": lempel_ziv,
 }
+
+
+def load_window_features(name):
+    """Load combined output or validate and join the two legacy cached files."""
+    path = OUTPUT_DIR / f"{name}_entropy_features.csv"
+    table = pd.read_csv(path)
+    prefixes = {c.rsplit("_", 1)[0] for c in table if c.startswith("ch") and "_" in c}
+    if not prefixes:
+        raise ValueError(f"{path.name}: no channel features found")
+    required = {f"{prefix}_{measure}" for prefix in prefixes
+                for measure in (*ENTROPIES, "LogPower", "RelPower")}
+    if not required.issubset(table.columns):
+        extra_path = OUTPUT_DIR / f"{name}_extra_features.csv"
+        if not extra_path.exists():
+            raise ValueError(f"{path.name} is an incomplete legacy cache and {extra_path.name} "
+                             f"is missing. Rerun python extract_entropy.py {name} to replace it.")
+        extra = pd.read_csv(extra_path)
+        overlap = set(table.columns).intersection(extra.columns) - {"subject_id", "label", "window"}
+        if overlap:
+            raise ValueError(f"{name}: overlapping feature columns in legacy caches: {sorted(overlap)}")
+        table = table.merge(extra, on=["subject_id", "window"], how="outer",
+                            validate="one_to_one", suffixes=("", "_extra"), indicator=True)
+        if not table["_merge"].eq("both").all() or not table.label.eq(table.label_extra).all():
+            raise ValueError(f"{name}: entropy and extra feature windows or labels do not match")
+        table = table.drop(columns=["_merge", "label_extra"])
+        prefixes = {c.rsplit("_", 1)[0] for c in table if c.startswith("ch") and "_" in c}
+        required = {f"{prefix}_{measure}" for prefix in prefixes
+                    for measure in (*ENTROPIES, "LogPower", "RelPower")}
+        missing = required - set(table.columns)
+        if missing:
+            raise ValueError(f"{name}: missing feature columns: {sorted(missing)}")
+    if table[["subject_id", "label", "window"]].isna().any().any():
+        raise ValueError(f"{name}: missing subject, label or window")
+    if table.duplicated(["subject_id", "window"]).any():
+        raise ValueError(f"{name}: duplicate subject/window rows")
+    return table
 
 
 # --------------------------------------------------------------------------
@@ -151,10 +236,15 @@ def process_subject(task):
         seg = sig[:, s:s + win]
         row = {"subject_id": sid, "label": label, "window": w}
         for ch in range(seg.shape[0]):
-            for band, coef in zip(BANDS, dwt_bands(seg[ch], fs, wavelet)):
+            coefs = dwt_bands(seg[ch], fs, wavelet)
+            energy = np.array([np.sum(c ** 2) for c in coefs])
+            total = energy.sum()
+            for band, coef, e in zip(BANDS, coefs, energy):
                 for ename, fn in ENTROPIES.items():
                     v = fn(coef)
                     row[f"ch{ch + 1:02d}_{band}_{ename}"] = v if np.isfinite(v) else np.nan
+                row[f"ch{ch + 1:02d}_{band}_LogPower"] = np.log10(e + 1e-12)
+                row[f"ch{ch + 1:02d}_{band}_RelPower"] = e / total if total > 0 else np.nan
         rows.append(row)
     return rows
 

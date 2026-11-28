@@ -12,54 +12,47 @@ Sortie  : sorties/05_binaire/<date>/
 Pour chaque base : une ligne par sujet (médiane ou moyenne des fenêtres), tous les canaux de la
 base (19 / 16 / 14) ou les 10 canaux communs (--canaux-communs). Modèles (--modeles) :
     reference_majoritaire   classe la plus fréquente
-    regression_logistique   L2, C = --c, classes pondérées
-    mlp                     MLP scikit-learn (lbfgs, alpha = --mlp-alpha)
-    svm_rbf, foret_aleatoire, lda (covariance rétrécie), xgboost (si installé)
+    regression_logistique   classes pondérées (L1/L2 réglées par recherche)
+    mlp, svm, svm_rbf, knn, foret_aleatoire, lda, xgboost, lightgbm
 Références de confusion (ajoutées d'office) :
     reference_amplitude       régression logistique sur log(écart-type avant standardisation) seul
     reference_canaux_origine  nombre de canaux du fichier d'origine seul (dépression : 20 ou 22)
 Validation : StratifiedGroupKFold par sujet (387-02w1 / 387-03w1 dans le même groupe), répétée
 --repetitions fois avec des graines successives ; prétraitement ajusté dans chaque pli.
---cv-imbriquee : C, alpha (MLP) et C (SVM) choisis par validation croisée interne groupée.
+Recherche aléatoire imbriquée groupée pour tous les modèles (sauf référence majoritaire).
+--sans-tuning désactive la recherche ; --profil-tuning quick permet un essai rapide.
+--caracteristiques : classiques (défaut), etendues, ou etendues_puissances.
+Les deux derniers choix exigent une extraction 03 avec --caracteristiques-etendues.
 
 Usage :
     python 05_classification_binaire.py
     python 05_classification_binaire.py --bases depression --canaux-origine 20
     python 05_classification_binaire.py --repetitions 10 --ablation --permutations 200
-    python 05_classification_binaire.py --cv-imbriquee --modeles regression_logistique mlp svm_rbf
+    python 05_classification_binaire.py --profil-tuning quick --modeles regression_logistique svm
 
-Dépendances : pip install numpy pandas scikit-learn matplotlib   (+ xgboost en option)
+Dépendances : numpy pandas scipy scikit-learn matplotlib xgboost lightgbm
 """
 import argparse
 import time
 from pathlib import Path
 
+from eeg_tuning import detect_devices, predict_proba, tune_and_fit
+
 import numpy as np
 import pandas as pd
 from sklearn.metrics import confusion_matrix
 
-from eeg_config import BANDS, BASES, CLASSES_BINAIRES, GRAINE, MEASURES, NOM_TROUBLE
+from eeg_config import BANDS, BASES, CLASSES_BINAIRES, GRAINE, MEASURES, MESURES_ETENDUES, NOM_TROUBLE, PUISSANCES
 from eeg_donnees import (agreger, ajouter_arguments_extraction, charger_extraction, dossier_extraction_defaut,
                          lire_carte_canaux)
-from eeg_utils import (Compteur, arguments_dict, ecrire_json, entete, fit_predict, fmt_table, log,
-                       make_estimator, make_folds, multiclass_scores, nouveau_dossier, p_valeur_permutation,
+from eeg_utils import (Compteur, arguments_dict, ecrire_json, entete, fmt_table, log,
+                       make_folds, multiclass_scores, nouveau_dossier, p_valeur_permutation,
                        plot_confusion, plot_roc, require, scores_binaires, summarise, versions,
                        xgboost_disponible)
 
-MODELES = ["reference_majoritaire", "regression_logistique", "mlp", "svm_rbf", "foret_aleatoire", "lda", "xgboost"]
-DEFAUT = ["reference_majoritaire", "regression_logistique", "mlp", "svm_rbf", "foret_aleatoire", "lda"]
-GRILLES = {"regression_logistique": {"logisticregression__C": [0.01, 0.1, 1.0, 10.0]},
-           "mlp": {"mlpclassifier__alpha": [0.1, 1.0, 10.0]},
-           "svm_rbf": {"svc__C": [0.1, 1.0, 10.0]}}
-
-
-def estimateur(nom, seed, args, groups_tr=None):
-    est = make_estimator(nom, seed, args.c, args.mlp_couches, args.mlp_alpha)
-    if args.cv_imbriquee and nom in GRILLES:
-        from sklearn.model_selection import GridSearchCV, StratifiedGroupKFold
-        est = GridSearchCV(est, GRILLES[nom], scoring="balanced_accuracy",
-                           cv=StratifiedGroupKFold(n_splits=3, shuffle=True, random_state=seed), n_jobs=1)
-    return est
+MODELES = ["reference_majoritaire", "regression_logistique", "mlp", "svm", "svm_rbf",
+           "knn", "foret_aleatoire", "lda", "xgboost", "lightgbm"]
+DEFAUT = [m for m in MODELES if m != "svm_rbf"]
 
 
 def cv_proba(nom, x, y, groups, folds, seed, args):
@@ -67,15 +60,15 @@ def cv_proba(nom, x, y, groups, folds, seed, args):
     fold_id = np.zeros(len(y), dtype=int)
     choix = []
     for k, (tr, te) in enumerate(folds, 1):
-        est = estimateur(nom, seed, args)
-        if args.cv_imbriquee and nom in GRILLES:
-            est.fit(x[tr], y[tr], groups=groups[tr])
-            choix.append(est.best_params_)
-            p = np.zeros((len(te), 2))
-            p[:, est.classes_.astype(int)] = est.predict_proba(x[te])
-        else:
-            p, _ = fit_predict(nom, seed, x[tr], y[tr], x[te], 2, estimateur=est)
-        proba[te] = p
+        est, result = tune_and_fit(nom, x[tr], y[tr], groups[tr], y[tr], seed,
+                                   args.devices, args.profil_tuning, args.plis_internes,
+                                   args.tirages_tuning, enabled=not args.sans_tuning,
+                                   fixed_c=args.c, fixed_mlp_layers=args.mlp_couches,
+                                   fixed_mlp_alpha=args.mlp_alpha)
+        est.fit(x[tr], y[tr])
+        if result["best_params"]:
+            choix.append(result)
+        proba[te] = predict_proba(est, x[te], 2)
         fold_id[te] = k
     return proba, fold_id, choix
 
@@ -92,7 +85,12 @@ def preparer_base(base, run, args, orders):
         require(keep.sum() >= 2 * args.plis, f"Trop peu d'enregistrements à {args.canaux_origine} canaux d'origine.")
         info["records"] = rec = rec.loc[keep]
         info["data"] = info["data"].loc[info["data"]["subject_id"].isin(rec.index)]
-    ent, amp = agreger(info, canaux)
+    mesures = list(MEASURES)
+    if args.caracteristiques != "classiques":
+        mesures += MESURES_ETENDUES
+    if args.caracteristiques == "etendues_puissances":
+        mesures += PUISSANCES
+    ent, amp = agreger(info, canaux, mesures)
     inputs = {"entropies": ent}
     if not args.sans_reference_amplitude:
         inputs["amplitude"] = amp
@@ -109,7 +107,7 @@ def analyser_base(base, run, args, orders, collect):
     ent = inputs["entropies"]
     require(min(np.bincount(y)) >= args.plis, f"{base} : moins de sujets d'une classe que de plis.")
     log(f"\n=== {base} ({NOM_TROUBLE[base]}) : {len(y)} sujets ({(y == 0).sum()} témoins, {(y == 1).sum()} trouble), "
-        f"{len(set(groups))} groupes, {len(canaux)} canaux, {ent.shape[1]} variables")
+        f"{len(set(groups))} groupes, {len(canaux)} canaux, {ent.shape[1]} variables ({args.caracteristiques})")
     specs = [(m, "entropies") for m in args.modeles]
     if "amplitude" in inputs:
         specs.append(("reference_amplitude", "amplitude"))
@@ -146,9 +144,10 @@ def analyser_base(base, run, args, orders, collect):
     if args.ablation:
         log("  Ablation (régression logistique, une mesure ou une bande seule) :")
         cols = pd.Series(ent.columns)
-        groupes_var = {f"mesure={m}": cols.str.endswith("|" + m) for m in MEASURES}
+        mesures = list(dict.fromkeys(c.rsplit("|", 1)[-1] for c in ent.columns))
+        groupes_var = {f"mesure={m}": cols.str.endswith("|" + m) for m in mesures}
         groupes_var.update({f"bande={b}": cols.str.contains(f"|{b}|", regex=False) for b in BANDS})
-        groupes_var.update({f"sans_mesure={m}": ~cols.str.endswith("|" + m) for m in MEASURES})
+        groupes_var.update({f"sans_mesure={m}": ~cols.str.endswith("|" + m) for m in mesures})
         for nom_g, mask in groupes_var.items():
             x = ent.loc[:, mask.to_numpy()].to_numpy(float)
             vals = []
@@ -173,14 +172,22 @@ def analyser_base(base, run, args, orders, collect):
             null = []
             for i in range(args.permutations):
                 yp = pd.Series(rng.permutation(g.to_numpy()), index=g.index).loc[groups].to_numpy()
-                try:
-                    folds = make_folds(yp, groups, args.plis, args.graine + 10_000 + i, must_have=yp, min_par_strate=2)
-                except ValueError:
+                repeated = []
+                for rep in range(args.repetitions):
+                    seed = args.graine + rep
+                    try:
+                        folds = make_folds(yp, groups, args.plis, seed, must_have=yp, min_par_strate=2)
+                    except ValueError as exc:
+                        log(f"    permutation {i + 1} ignorée : {exc}")
+                        break
+                    proba, _, _ = cv_proba(nom, x, yp, groups, folds, seed, args)
+                    repeated.append(multiclass_scores(yp, proba, [0, 1])[0]["exactitude_equilibree"])
+                if len(repeated) != args.repetitions:
                     continue
-                proba, _, _ = cv_proba(nom, x, yp, groups, folds, args.graine + i, args)
-                null.append(multiclass_scores(yp, proba, [0, 1])[0]["exactitude_equilibree"])
+                null.append(np.mean(repeated))
             obs = np.mean([r["exactitude_equilibree"] for r in collect["rows"] if r["tache"] == task and r["modele"] == nom])
             null = np.array(null)
+            require(len(null) > 0, f"{base} : aucune permutation valide pour {nom}.")
             collect["perms"].append(dict(base=base, modele=nom, observe=obs, moyenne_nulle=null.mean(),
                                          quantile_95_nul=np.quantile(null, 0.95), p_valeur=p_valeur_permutation(obs, null),
                                          n_permutations=len(null)))
@@ -199,22 +206,37 @@ def main():
     p.add_argument("--canaux-origine", type=int, default=None,
                    help="Dépression : garder les fichiers d'origine à ce nombre de canaux (20 ou 22).")
     p.add_argument("--modeles", nargs="+", choices=MODELES, default=DEFAUT)
+    p.add_argument("--caracteristiques", choices=["classiques", "etendues", "etendues_puissances"],
+                   default="classiques", help="Jeu de variables ; les jeux étendus exigent l'option correspondante en 03.")
     p.add_argument("--sans-reference-amplitude", action="store_true")
     p.add_argument("--plis", type=int, default=5)
     p.add_argument("--repetitions", type=int, default=10)
     p.add_argument("--graine", type=int, default=GRAINE)
-    p.add_argument("--c", type=float, default=1.0, help="Inverse de la pénalité L2 (régression logistique).")
+    p.add_argument("--c", type=float, default=1.0, help="C de la régression logistique avec --sans-tuning.")
     p.add_argument("--mlp-couches", type=int, nargs="+", default=[16])
     p.add_argument("--mlp-alpha", type=float, default=1.0)
-    p.add_argument("--cv-imbriquee", action="store_true", help="Hyperparamètres choisis par CV interne groupée.")
+    p.add_argument("--cv-imbriquee", action="store_true", help="Compatibilité : la recherche imbriquée est maintenant activée par défaut.")
+    p.add_argument("--sans-tuning", action="store_true", help="Désactiver la recherche imbriquée.")
+    p.add_argument("--profil-tuning", choices=["quick", "comprehensive"], default="comprehensive")
+    p.add_argument("--plis-internes", type=int, default=None)
+    p.add_argument("--tirages-tuning", type=int, default=None, help="Nombre de candidats par modèle et pli.")
+    p.add_argument("--cpu", action="store_true", help="Désactiver les sondes GPU et utiliser le CPU.")
     p.add_argument("--ablation", action="store_true", help="Contribution de chaque mesure et de chaque bande.")
     p.add_argument("--permutations", type=int, default=0)
     p.add_argument("--permutation-modeles", nargs="+", choices=MODELES, default=["regression_logistique"])
     args = p.parse_args()
-    if args.plis < 2 or args.repetitions < 1:
-        p.error("--plis >= 2 et --repetitions >= 1.")
+    if (args.plis < 2 or args.repetitions < 1 or args.permutations < 0
+            or (args.plis_internes is not None and args.plis_internes < 2)
+            or (args.tirages_tuning is not None and args.tirages_tuning < 1)):
+        p.error("--plis >= 2, --repetitions >= 1, --permutations >= 0, --plis-internes >= 2, --tirages-tuning >= 1.")
+    if args.cv_imbriquee and args.sans_tuning:
+        p.error("--cv-imbriquee et --sans-tuning sont incompatibles.")
+    if args.permutations and not set(args.permutation_modeles).intersection(args.modeles):
+        p.error("Aucun modèle de permutation n'est sélectionné dans --modeles.")
     if "xgboost" in args.modeles and not xgboost_disponible():
         p.error("xgboost demandé mais absent (pip install xgboost).")
+    args.devices = {"xgboost": "cpu", "lightgbm": "cpu"} if args.cpu else detect_devices(args.modeles)
+    log(f"Calcul : XGBoost={args.devices['xgboost']}, LightGBM={args.devices['lightgbm']}; autres modèles sur CPU.")
     start = time.time()
     orders = lire_carte_canaux(args.carte_canaux)
     collect = dict(rows=[], preds=[], ablation=[], perms=[], infos={})
@@ -263,7 +285,7 @@ def main():
     if Compteur.non_converges:
         log(f"Avertissement : {Compteur.non_converges} ajustements non convergés.")
     ecrire_json(out / "parametres.json", {
-        "portee": "Évaluation exploratoire interne ; hyperparamètres fixés a priori sauf --cv-imbriquee.",
+        "portee": "Évaluation exploratoire interne ; recherche imbriquée sauf --sans-tuning.",
         "bases": collect["infos"], "classes": CLASSES_BINAIRES,
         "validation": f"StratifiedGroupKFold {args.plis} plis × {args.repetitions} répétitions, graines "
                       f"{args.graine}..{args.graine + args.repetitions - 1}",

@@ -7,13 +7,24 @@ import numpy as np
 import pandas as pd
 from xgboost import XGBClassifier
 
-from leakage_audit import audit_recordings, audit_window_features
+from leakage_audit import audit_recordings, audit_window_features, exclude_notebook_recordings
 from model_tuning import (BalancedXGBClassifier, bootstrap_ci, build_models, evaluate_dataset,
                           grouped_splits, permute_group_labels, search_space_for_splits,
                           validation_groups)
 
 
 class LeakageEvaluationTests(unittest.TestCase):
+    def test_notebook_excludes_only_selected_borisov_recording(self):
+        table = pd.DataFrame({
+            'dataset': ['borisov', 'borisov', 'borisov', 'borisov', 'sakib'],
+            'subject_id': ['SZ_387-02w1', 'SZ_387-02w1', 'SZ_387-03w1', 'SZ_other', 'SZ_387-02w1'],
+            'window': [0, 1, 0, 0, 0],
+        })
+        filtered = exclude_notebook_recordings(table)
+        self.assertEqual(filtered[['dataset', 'subject_id']].values.tolist(),
+                         [['borisov', 'SZ_387-03w1'], ['borisov', 'SZ_other'], ['sakib', 'SZ_387-02w1']])
+        self.assertEqual(len(table), 5)
+
     def test_related_recordings_stay_in_same_group_and_predictions_are_separate(self):
         subjects = ['SZ_387-02w1', 'SZ_387-03w1'] + [f'subject{i}' for i in range(22)]
         labels = np.array([1, 1] + [i % 2 for i in range(22)])

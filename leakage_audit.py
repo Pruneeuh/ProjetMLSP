@@ -9,6 +9,15 @@ import pandas as pd
 from model_tuning import validation_groups
 
 
+def exclude_notebook_recordings(table):
+    """Exclude one potentially related Borisov recording from notebook analyses."""
+    excluded = table['dataset'].eq('borisov') & table['subject_id'].eq('SZ_387-02w1')
+    if excluded.any():
+        subjects = sorted(table.loc[excluded, 'subject_id'].unique())
+        print(f"Borisov: excluding {', '.join(subjects)} ({excluded.sum()} rows)")
+    return table.loc[~excluded].copy()
+
+
 def audit_window_features(table, feature_columns, dataset):
     """Reject duplicate feature rows belonging to different validation groups."""
     required = {'subject_id', 'label', 'window', *feature_columns}

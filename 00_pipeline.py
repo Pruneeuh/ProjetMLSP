@@ -34,10 +34,13 @@ ETAPES = {
     10: "10_synthese_resultats.py",
 }
 RAPIDE = {
-    5: ["--repetitions", "2", "--permutations", "10"],
-    6: ["--repetitions", "2", "--permutations", "10"],
+    5: ["--repetitions", "1", "--modeles", "regression_logistique", "--profil-tuning", "quick",
+        "--plis-internes", "2", "--tirages-tuning", "1"],
+    6: ["--repetitions", "1", "--modeles", "regression_logistique", "--harmonisations", "zscore",
+        "--profil-tuning", "quick", "--plis-internes", "2", "--tirages-tuning", "1", "--sans-lodo"],
     7: ["--repetitions", "1", "--epoques", "30"],
-    9: ["--repetitions", "1", "--tirages", "2"],
+    9: ["--repetitions", "1", "--tirages", "2", "--profil-tuning", "quick",
+        "--plis-internes", "2", "--tirages-tuning", "1"],
     10: ["--bootstrap", "300"],
 }
 

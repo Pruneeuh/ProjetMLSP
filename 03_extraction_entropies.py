@@ -12,6 +12,9 @@ Sortie  : sorties/03_extraction/<base>_<date>/
     features_large.csv         (option --large) une ligne par fenêtre, colonnes canal_bande_mesure
     parametres_extraction.json
 
+Avec --caracteristiques-etendues : ApEn, PermEn, Shannon_amplitude, LogPower et RelPower.
+LogPower est le log10 de l'énergie DWT en µV², pas une puissance moyenne.
+
 Chaîne de traitement, pour chaque enregistrement :
   1. filtre Butterworth passe-bande 0,5-45 Hz (ordre 4, phase nulle), coupe-bande secteur en option ;
   2. rééchantillonnage à 128 Hz (Mumtaz 256 → 128 Hz) pour que les composantes DWT
@@ -33,9 +36,9 @@ Usage :
     python 03_extraction_entropies.py                         # les 3 bases
     python 03_extraction_entropies.py anxiete --workers 4
     python 03_extraction_entropies.py --fenetre 10 --chevauchement 0.5 --duree-max 60
-    python 03_extraction_entropies.py --entropyhub --large
+    python 03_extraction_entropies.py --entropyhub --caracteristiques-etendues --large
 
-Dépendances : pip install numpy scipy pandas pywavelets   (+ EntropyHub pour --entropyhub)
+Dépendances : pip install numpy scipy pandas pywavelets   (+ EntropyHub pour --entropyhub ou --caracteristiques-etendues)
 """
 import argparse
 import math
@@ -50,7 +53,7 @@ import pywt
 from scipy.signal import butter, iirnotch, resample_poly, sosfiltfilt, filtfilt, welch
 from scipy.special import ndtr
 
-from eeg_config import AMPLITUDE, BANDPASS, BANDS, BASES, FS_CIBLE, MEASURES
+from eeg_config import AMPLITUDE, BANDPASS, BANDS, BASES, FS_CIBLE, MEASURES, MESURES_ETENDUES, PUISSANCES
 from eeg_donnees import canaux_sauvegardes, charger_signaux
 from eeg_utils import arguments_dict, ecrire_json, log, nouveau_dossier, versions
 
@@ -235,6 +238,24 @@ def calculer_mesures(coef, p):
     return sd, {m: (vals[m] if np.isfinite(vals[m]) else np.nan) for m in MEASURES}
 
 
+def mesures_etendues(coef):
+    """Mesures du notebook sur les coefficients DWT non standardisés."""
+    coef = np.asarray(coef, dtype=np.float64)
+    sd = float(coef.std())
+    if not np.isfinite(sd) or sd == 0:
+        return {name: np.nan for name in MESURES_ETENDUES}
+    from EntropyHub import ApEn, PermEn
+
+    hist, _ = np.histogram(coef, bins=8)
+    probabilities = hist[hist > 0] / hist.sum()
+    values = {
+        "ApEn": _last(ApEn(coef, m=2, r=0.2 * sd)[0]),
+        "PermEn": _last(PermEn(coef, m=4, tau=1)[1]),
+        "Shannon_amplitude": float(-np.sum(probabilities * np.log2(probabilities)) / np.log2(8)),
+    }
+    return values
+
+
 # --------------------------------------------------------------------------
 # Traitement d'un enregistrement (exécuté dans un processus fils)
 # --------------------------------------------------------------------------
@@ -252,8 +273,20 @@ def process_subject(task):
     for w, s in enumerate(starts):
         seg = sig[:, s:s + win]
         for ch in range(seg.shape[0]):
-            for band, coef in zip(BANDS, dwt_bands(seg[ch], FS_CIBLE, p["ondelette"])):
+            coefs = dwt_bands(seg[ch], FS_CIBLE, p["ondelette"])
+            if p["caracteristiques_etendues"]:
+                energies = np.array([np.sum(coef ** 2) for coef in coefs])
+                if not np.isfinite(energies).all():
+                    raise ValueError(f"{base}/{sid} : énergie DWT non finie")
+                total = energies.sum()
+                if not np.isfinite(total):
+                    raise ValueError(f"{base}/{sid} : énergie DWT totale non finie")
+            for j, (band, coef) in enumerate(zip(BANDS, coefs)):
                 sd, vals = calculer_mesures(coef, p)
+                if p["caracteristiques_etendues"]:
+                    vals.update(mesures_etendues(coef))
+                    vals["LogPower"] = float(np.log10(energies[j] + 1e-12))
+                    vals["RelPower"] = float(energies[j] / total) if total > 0 else np.nan
                 rows.append(dict(dataset=base, subject_id=sid, group_validation=group, label=label, window=w,
                                  channel=canaux[ch], band=band, **{AMPLITUDE: sd}, **vals))
     return sid, rows, len(starts)
@@ -300,14 +333,16 @@ def run_dataset(base, args, p):
         log(f"  ! {int(sans_fenetre.sum())} enregistrement(s) trop court(s) pour une fenêtre : exclus")
         audit.loc[sans_fenetre, "statut"] = "trop_court"
     audit.to_csv(out / "audit_enregistrements.csv", index=False)
+    measures = MEASURES + (MESURES_ETENDUES + PUISSANCES if p["caracteristiques_etendues"] else [])
     if args.large:
         large = df.pivot_table(index=["subject_id", "label", "window"], columns=["channel", "band"],
-                               values=MEASURES + [AMPLITUDE], aggfunc="first")
+                               values=measures + [AMPLITUDE], aggfunc="first")
         large.columns = [f"{c}_{b}_{m}" for m, c, b in large.columns]
         large.reset_index().to_csv(out / "features_large.csv", index=False)
-    n_nan = df[MEASURES].isna().sum().to_dict()
+    n_nan = df[measures].isna().sum().to_dict()
     ecrire_json(out / "parametres_extraction.json", {
-        "base": base, "canaux": canaux, "fs_cible": FS_CIBLE, "bandes": BANDS, "mesures": MEASURES,
+        "base": base, "canaux": canaux, "fs_cible": FS_CIBLE, "bandes": BANDS, "mesures": measures,
+        "puissances": "LogPower = log10(énergie DWT en µV² + 1e-12), RelPower = énergie / somme des 5 énergies",
         "parametres": p, "enregistrements": int(audit["statut"].eq("extrait").sum()),
         "fenetres": int(df.groupby("subject_id")["window"].nunique().sum()) if len(df) else 0,
         "valeurs_manquantes": n_nan, "duree_s": round(time.time() - t0, 1),
@@ -332,6 +367,8 @@ def main():
     p.add_argument("--n-fuzzy", type=float, default=2.0, help="Exposant de l'appartenance floue.")
     p.add_argument("--c-disp", type=int, default=6, help="Nombre de classes de DispEn.")
     p.add_argument("--entropyhub", action="store_true", help="Utiliser EntropyHub pour SampEn, FuzzyEn, DispEn.")
+    p.add_argument("--caracteristiques-etendues", action="store_true",
+                   help="Ajouter ApEn, PermEn, Shannon amplitude et énergies DWT (EntropyHub requis).")
     p.add_argument("--large", action="store_true", help="Écrire aussi features_large.csv (une ligne par fenêtre).")
     p.add_argument("--limite", type=int, default=None, help="N premiers enregistrements seulement (essai).")
     p.add_argument("--workers", type=int, default=max(1, (os.cpu_count() or 2) - 1))
@@ -339,21 +376,22 @@ def main():
     bad = [b for b in args.bases if b not in BASES]
     if bad:
         p.error(f"base(s) inconnue(s) : {bad}")
-    if args.entropyhub:
+    if args.entropyhub or args.caracteristiques_etendues:
         try:
             import EntropyHub  # noqa: F401
         except ModuleNotFoundError:
-            p.error("--entropyhub demandé mais EntropyHub est absent (pip install EntropyHub).")
+            p.error("EntropyHub est requis pour --entropyhub ou --caracteristiques-etendues (pip install EntropyHub).")
     params = dict(fenetre=args.fenetre, chevauchement=args.chevauchement, duree_max=args.duree_max,
                   notch=args.notch, ondelette=args.ondelette, m=args.m, r=args.r, n_fuzzy=args.n_fuzzy,
-                  c_disp=args.c_disp, entropyhub=args.entropyhub, bandpass=list(BANDPASS))
+                  c_disp=args.c_disp, entropyhub=args.entropyhub,
+                  caracteristiques_etendues=args.caracteristiques_etendues, bandpass=list(BANDPASS))
     log(f"workers = {args.workers}")
     sorties = []
     for base in args.bases or BASES:
         try:
             sorties.append(run_dataset(base, args, params))
         except ValueError as exc:
-            log(f"[{base}] arrêté : {exc}")
+            p.exit(1, f"[{base}] arrêté : {exc}\n")
     for s in sorties:
         log(f"SORTIE : {s}")
 
