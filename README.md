@@ -28,18 +28,22 @@ export PYTHONNOUSERSITE=1
 Si l'environnement n'existe pas, le créer d'abord après avoir chargé les modules :
 `python -m venv ~/venvs/projetmlsp-valeria`.
 
-Depuis la racine du dépôt, avec la wheelhouse Valeria configurée et accès à PyPI :
+Depuis la racine du dépôt, avec la wheelhouse Valeria configurée et accès à PyPI et GitHub :
 
 ```bash
-python -m pip --isolated install --only-binary=:all: --index-url https://pypi.org/simple -r requirement.txt
-python -m pip check
+python 00_notebook_install.py requirement.txt
 python -c 'import runpy; exec(runpy.run_path("00_package_installs.py")["SMOKE_TEST"])'
 python -c "from eeg_gpu_entropies import detecter_cuda; detecter_cuda()"
 python 00_pipeline.py --workers 1
 ```
 
-L'installation en une commande à partir de `requirement.txt` n'a pas encore été vérifiée
-sur Valeria : les wheels et leurs dépendances peuvent varier. Le fichier reflète un
+L'installateur convertit le wheel CuPy avec une révision épinglée de l'outil officiel
+Alliance `unmanylinuxize.sh`, puis installe les dépendances et vérifie l'import de CuPy.
+Il nécessite `git`, `bash`, `wget` et `setrpaths` dans le `PATH` ainsi que l'environnement
+logiciel Alliance. Dans un noyau Python système, il installe dans les paquets utilisateur,
+ce qui peut affecter d'autres notebooks du même compte. Redémarrer le noyau après installation.
+Cette conversion n'a pas encore été vérifiée sur Valeria : les wheels et leurs dépendances
+peuvent varier. Le fichier reflète un
 environnement Python 3.12 observé sur Valeria, pas un verrouillage complet ni une garantie
 de compatibilité avec Colab. MNE 1.12.1 nécessite PyPI dans la configuration observée ;
 MNE 1.9.0 avec le SciPy observé échoue à la lecture EDF. Pour vérifier une lecture réelle :
@@ -57,9 +61,10 @@ python -m ipykernel install --user --name projetmlsp-valeria \
 ```
 
 Démarrer Jupyter avec les modules chargés et sélectionner ce noyau. Le notebook
-`00_pipeline_notebook.ipynb` installe les dépendances dans le noyau sélectionné, vérifie
-`pip check`, puis lance le pipeline. Régler le chemin du dépôt dans sa première cellule si
-nécessaire. L'installation modifie l'environnement sélectionné.
+`00_pipeline_notebook.ipynb` installe les dépendances pour le noyau sélectionné, vérifie
+`pip check`, puis lance le pipeline. Après installation, redémarrer le noyau, relancer la
+première cellule et passer directement à la cellule du pipeline. Régler le chemin du dépôt
+dans la première cellule si nécessaire.
 
 Le calcul complet peut durer longtemps. Pour un essai seulement :
 
