@@ -1,9 +1,11 @@
 import ast
+import hashlib
 import importlib.util
 import io
 import json
 import os
 import subprocess
+import sys
 import tempfile
 import unittest
 import zipfile
@@ -60,12 +62,19 @@ class PackageInstallerTests(unittest.TestCase):
     def test_notebook_installs_converted_wheel_and_checks_current_environment(self):
         py = f"cp{notebook_installer.sys.version_info.major}{notebook_installer.sys.version_info.minor}"
         release = {"urls": [{"filename": f"cupy_cuda12x-14.2.0-{py}-{py}-manylinux2014_x86_64.whl",
-                             "url": "https://example.test/cupy.whl", "yanked": False}]}
+                             "url": "https://example.test/cupy.whl", "yanked": False,
+                             "digests": {"sha256": hashlib.sha256(b"wheel").hexdigest()}}]}
         calls = []
 
         def run(command, **kwargs):
             calls.append(command)
-            if command[:2] == ["bash", "-e"]:
+            if command[0] == "git" and "clone" in command:
+                builder = Path(command[-1])
+                builder.mkdir()
+                (builder / "manipulate_wheels.py").write_text(f"#!{sys.executable}\n", encoding="utf-8")
+            elif command[0] == "wget":
+                Path(command[command.index("-O") + 1]).write_bytes(b"wheel")
+            elif "--insert_local_version" in command:
                 wheel = Path(kwargs["cwd"]) / f"cupy_cuda12x-14.2.0+computecanada-{py}-{py}-linux_x86_64.whl"
                 with zipfile.ZipFile(wheel, "w") as archive:
                     archive.writestr("cupy/__init__.py", "test")
@@ -83,8 +92,11 @@ class PackageInstallerTests(unittest.TestCase):
                               return_value=io.BytesIO(json.dumps(release).encode())), \
                  patch.object(notebook_installer.subprocess, "run", side_effect=run):
                 notebook_installer.install(requirements)
-        convert = next(command for command in calls if command[:2] == ["bash", "-e"])
-        self.assertIn("https://example.test/cupy.whl", convert)
+        download = next(command for command in calls if command[0] == "wget")
+        self.assertIn("https://example.test/cupy.whl", download)
+        self.assertTrue(any(command[0] == "setrpaths" for command in calls))
+        helper = next(command for command in calls if "--insert_local_version" in command)
+        self.assertEqual(helper[0], sys.executable)
         install_calls = [c for c in calls if "install" in c and "pip" in c]
         self.assertEqual(len(install_calls), 2)
         self.assertTrue(all("--user" in command for command in install_calls))
@@ -107,18 +119,47 @@ class PackageInstallerTests(unittest.TestCase):
 
         def run(command, **kwargs):
             calls.append(command)
-            if command[:2] == ["bash", "-e"]:
+            if command[0] == "git" and "clone" in command:
+                builder = Path(command[-1])
+                builder.mkdir()
+                (builder / "manipulate_wheels.py").write_text(f"#!{sys.executable}\n", encoding="utf-8")
+            elif command[0] == "wget":
                 raise subprocess.CalledProcessError(1, command)
 
         with tempfile.TemporaryDirectory() as tmp:
             requirements = Path(tmp) / "requirement.txt"
             requirements.write_text("cupy-cuda12x==14.2.0\n", encoding="utf-8")
-            with patch.object(notebook_installer, "cupy_wheel_url", return_value="https://example.test/cupy.whl"), \
+            wheel_info = {"filename": "cupy.whl", "url": "https://example.test/cupy.whl"}
+            with patch.object(notebook_installer, "cupy_wheel", return_value=wheel_info), \
                  patch.object(notebook_installer.shutil, "which", return_value="available"), \
                  patch.object(notebook_installer.subprocess, "run", side_effect=run), \
                  self.assertRaises(subprocess.CalledProcessError):
                 notebook_installer.install(requirements)
         self.assertFalse(any("pip" in command for command in calls))
+
+    def test_notebook_rejects_download_with_wrong_checksum(self):
+        calls = []
+
+        def run(command, **kwargs):
+            calls.append(command)
+            if command[0] == "git" and "clone" in command:
+                builder = Path(command[-1])
+                builder.mkdir()
+                (builder / "manipulate_wheels.py").write_text(f"#!{sys.executable}\n", encoding="utf-8")
+            elif command[0] == "wget":
+                Path(command[command.index("-O") + 1]).write_bytes(b"corrupted")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            requirements = Path(tmp) / "requirement.txt"
+            requirements.write_text("cupy-cuda12x==14.2.0\n", encoding="utf-8")
+            wheel_info = {"filename": "cupy.whl", "url": "https://example.test/cupy.whl",
+                          "digests": {"sha256": hashlib.sha256(b"expected").hexdigest()}}
+            with patch.object(notebook_installer, "cupy_wheel", return_value=wheel_info), \
+                 patch.object(notebook_installer.shutil, "which", return_value="available"), \
+                 patch.object(notebook_installer.subprocess, "run", side_effect=run), \
+                 self.assertRaisesRegex(ValueError, "SHA-256"):
+                notebook_installer.install(requirements)
+        self.assertFalse(any(command[0] == "setrpaths" or "pip" in command for command in calls))
 
     def test_isolated_install_uses_wheelhouse_and_checks_dependencies(self):
         with tempfile.TemporaryDirectory() as tmp:

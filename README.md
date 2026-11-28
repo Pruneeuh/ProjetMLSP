@@ -37,9 +37,10 @@ python -c "from eeg_gpu_entropies import detecter_cuda; detecter_cuda()"
 python 00_pipeline.py --workers 1
 ```
 
-L'installateur convertit le wheel CuPy avec une révision épinglée de l'outil officiel
-Alliance `unmanylinuxize.sh`, puis installe les dépendances et vérifie l'import de CuPy.
-Il nécessite `git`, `bash`, `wget` et `setrpaths` dans le `PATH` ainsi que l'environnement
+L'installateur suit les étapes de conversion de l'outil officiel Alliance
+`unmanylinuxize.sh`, en utilisant `setrpaths` et une révision épinglée de son outil
+`manipulate_wheels.py`. Il installe ensuite les dépendances et vérifie l'import de CuPy.
+Il nécessite `git`, `wget` et `setrpaths` dans le `PATH` ainsi que l'environnement
 logiciel Alliance. Dans un noyau Python système, il installe dans les paquets utilisateur,
 ce qui peut affecter d'autres notebooks du même compte. Redémarrer le noyau après installation.
 Cette conversion n'a pas encore été vérifiée sur Valeria : les wheels et leurs dépendances
