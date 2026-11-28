@@ -22,6 +22,7 @@ Usage :
 Les options propres à une étape se règlent en lançant l'étape directement (python 06_... --help).
 """
 import argparse
+import json
 import os
 import subprocess
 import sys
@@ -31,6 +32,7 @@ from pathlib import Path
 
 from eeg_cache_pipeline import CachePipeline, signature, sources_brutes
 from eeg_config import BASES
+from eeg_gpu_entropies import detecter_cuda
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 ETAPES = {
@@ -52,9 +54,9 @@ RAPIDE = {
 }
 OPTIONS_ANALYSE = {
     4: ["--caracteristiques-etendues"],
-    5: ["--caracteristiques", "etendues_puissances", "--ablation"],
-    6: ["--caracteristiques", "etendues_puissances"],
-    9: ["--caracteristiques", "etendues_puissances", "--shap"],
+    5: ["--caracteristiques", "etendues_puissances", "--ablation", "--rapids"],
+    6: ["--caracteristiques", "etendues_puissances", "--rapids"],
+    9: ["--caracteristiques", "etendues_puissances", "--shap", "--rapids"],
 }
 
 
@@ -92,6 +94,8 @@ def main():
     p.add_argument("--workers", type=int, default=None, help="Processus pour l'extraction (étape 3).")
     p.add_argument("--rapide", action="store_true", help="Réglages réduits pour un essai.")
     p.add_argument("--sans-reseaux", action="store_true", help="Sauter l'étape 7 même si elle est demandée.")
+    p.add_argument("--sans-rapids", action="store_true", help="Ne pas activer l'accélération RAPIDS en 05, 06 et 09.")
+    p.add_argument("--cpu-entropies", action="store_true", help="Forcer le CPU pour l'extraction 03.")
     p.add_argument("--continuer", action="store_true", help="Continuer après un échec, sauf pour les étapes 01–04.")
     p.add_argument("--recalculer", action="store_true", help="Recalculer 01–04 même si leurs sorties sont vérifiées.")
     args = p.parse_args()
@@ -106,12 +110,20 @@ def main():
     for e in etapes:
         cmd = [sys.executable, str(SCRIPT_DIR / ETAPES[e])]
         cmd += OPTIONS_ANALYSE.get(e, [])
+        if args.sans_rapids and "--rapids" in cmd:
+            cmd.remove("--rapids")
+        calcul, gpu_info = None, None
+        if e == 3:
+            calcul, gpu_info = ("cpu", None) if args.cpu_entropies else detecter_cuda()
+            cmd += ["--calcul", calcul]
         inputs = []
         key = None
         if e <= 4:
             try:
                 inputs = entrees_etape(e, args, resultats)
                 options = OPTIONS_ANALYSE.get(e, []) + (["--workers", str(args.workers)] if e == 3 and args.workers else [])
+                if e == 3:
+                    options += ["--calcul", calcul, "--gpu-info", json.dumps(gpu_info, sort_keys=True)]
                 key = signature(e, inputs, options, SCRIPT_DIR)
                 cached = None if args.recalculer else cache.trouver(e, key)
             except (OSError, ValueError) as exc:
@@ -165,6 +177,10 @@ def main():
             elif e == 2:
                 sorties = [pretraitement]
             try:
+                if e == 3 and not args.cpu_entropies:
+                    calcul_apres, gpu_apres = detecter_cuda()
+                    if (calcul_apres, gpu_apres) != (calcul, gpu_info):
+                        raise ValueError("le dispositif de calcul a changé pendant l'extraction")
                 if signature(e, inputs, options, SCRIPT_DIR) != key:
                     raise ValueError("les entrées ont changé pendant l'exécution")
                 cache.enregistrer(e, key, sorties)

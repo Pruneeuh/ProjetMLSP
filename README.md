@@ -78,6 +78,52 @@ les étapes 01 à 06 et 08 à 10 dans l'environnement activé, sans réinstaller
 L'étape 07 reste accessible explicitement via `--etapes 7 10` ou directement. La synthèse
 du lanceur exclut les anciens résultats 07 lorsqu'elle n'a pas été exécutée avec succès.
 
+Le lanceur essaie également RAPIDS (`cuml.accel`) dans les processus 05, 06 et 09, avant
+l'import de scikit-learn. RAPIDS doit être installé séparément dans l'environnement activé ;
+vérifier avec `avail_wheels cuml` les wheels compatibles avec les modules CUDA et Python
+de Valeria. Sa disponibilité dans la wheelhouse n'a pas été vérifiée. Si cuML n'est pas
+installé ou si aucun GPU CUDA n'est visible, un message explique le retour au CPU. Une
+installation incompatible est une erreur et doit être corrigée.
+
+Si la wheelhouse fournit une version `cuml-cu12` compatible avec l'environnement et le
+CUDA de la session, l'installer dans l'environnement activé, puis vérifier les dépendances :
+
+```bash
+python -m pip install --no-index --only-binary=:all: cuml-cu12
+python -m pip check
+```
+
+Cette commande n'est pas adaptée aux autres versions CUDA ni garantie disponible sur
+Valeria ; consulter `avail_wheels cuml` avant de l'utiliser.
+
+Quand RAPIDS est actif, ses journaux INFO indiquent quelles opérations tournent sur GPU
+ou reviennent au CPU ; ne pas supposer que tous les modèles sont accélérés. LDA et MLP
+restent sur CPU avec les implémentations actuelles ; le SVM avec `probability=True` peut
+aussi y revenir. Les modèles RAPIDS peuvent différer numériquement de scikit-learn.
+XGBoost et LightGBM testent leurs GPU indépendamment ; un échec ultérieur est signalé.
+Le prétraitement et certaines opérations d'extraction restent sur CPU. Le mode rapide
+ne sélectionne pas XGBoost ni LightGBM. Utiliser `--sans-rapids` sur le lanceur pour
+conserver le comportement scikit-learn précédent, ou `--rapids` en lançant 05, 06 ou 09
+directement. Vérifier les journaux et la compatibilité SHAP sur la machine cible.
+
+L'étape 03 essaie également CuPy sur un GPU CUDA pour les calculs de paires de SampEn,
+FuzzyEn et RCMSE. Elle utilise alors un seul processus ; les autres mesures, la DWT et les
+puissances restent sur CPU. Sans CuPy ou GPU visible, elle annonce le retour au CPU ;
+une erreur ultérieure n'est pas masquée. `--cpu-entropies` force le CPU dans le lanceur ;
+en exécution directe, `03 --calcul cpu`, `auto` ou `cuda` sélectionne le dispositif
+(`cuda` échoue si le GPU est indisponible). Le cache du lanceur tient compte du dispositif.
+
+Vérifier `avail_wheels cupy` ; si la wheelhouse fournit une version compatible avec
+l'environnement et CUDA 12, l'installation possible dans l'environnement activé est :
+
+```bash
+python -m pip install --no-index --only-binary=:all: cupy-cuda12x
+python -m pip check
+```
+
+Le calcul GPU n'a pas encore été vérifié sur Valeria : comparer ses résultats à ceux du
+CPU avant de les interpréter. Il peut aussi être plus lent pour de petits signaux.
+
 Pour Jupyter, après activation, enregistrer un noyau avec un nom qui n'existe pas déjà :
 
 ```bash

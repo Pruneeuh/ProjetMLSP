@@ -1,17 +1,65 @@
 import contextlib
 import io
+import os
+import subprocess
 import sys
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from lightgbm.basic import LightGBMError
 
 import gpu_setup
+import eeg_gpu_entropies
 import model_tuning
 
 
 class GPUSetupTests(unittest.TestCase):
+    def test_entropy_gpu_unavailable_is_reported(self):
+        with patch('eeg_gpu_entropies.importlib.util.find_spec', return_value=None), \
+             contextlib.redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(eeg_gpu_entropies.detecter_cuda(), ('cpu', None))
+        self.assertIn('CPU', output.getvalue())
+
+    def test_entropy_gpu_probe_records_device_and_versions(self):
+        import numpy as np
+
+        runtime = SimpleNamespace(getDeviceCount=lambda: 1, getDeviceProperties=lambda _: {'name': b'test GPU'},
+                                  driverGetVersion=lambda: 123, runtimeGetVersion=lambda: 456,
+                                  CUDARuntimeError=RuntimeError)
+        cupy = SimpleNamespace(cuda=SimpleNamespace(runtime=runtime), float64=np.float64,
+                               asarray=np.asarray, exp=np.exp, __version__='1.0')
+        with patch('eeg_gpu_entropies.importlib.util.find_spec', return_value=object()), \
+             patch.dict(sys.modules, {'cupy': cupy}), contextlib.redirect_stdout(io.StringIO()):
+            backend, info = eeg_gpu_entropies.detecter_cuda()
+        self.assertEqual(backend, 'cuda')
+        self.assertEqual(info, {'device': 'test GPU', 'cupy': '1.0', 'driver': 123, 'runtime': 456})
+
+    def test_pipeline_scripts_enable_rapids_before_loading_models(self):
+        root = Path(__file__).resolve().parents[1]
+        bootstrap = """
+import runpy, sys, types
+module = types.ModuleType("gpu_setup")
+def enable():
+    if "sklearn" in sys.modules:
+        raise RuntimeError("sklearn was imported before RAPIDS")
+    print("RAPIDS startup checked")
+    return False
+module.enable_cuml_accel = enable
+sys.modules["gpu_setup"] = module
+script = sys.argv[1]
+sys.argv = [script, "--rapids", "--help"]
+runpy.run_path(script, run_name="__main__")
+"""
+        for name in ('05_classification_binaire.py', '06_classification_multiclasse.py', '09_interpretabilite.py'):
+            with self.subTest(script=name):
+                result = subprocess.run([sys.executable, '-c', bootstrap, str(root / name)], cwd=root,
+                                        env={**os.environ, 'PYTHONIOENCODING': 'utf-8'},
+                                        capture_output=True, text=True, encoding='utf-8')
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn('RAPIDS startup checked', result.stdout)
+
     def test_missing_rapids_is_reported(self):
         with patch('gpu_setup.importlib.util.find_spec', return_value=None):
             with contextlib.redirect_stdout(io.StringIO()) as output:

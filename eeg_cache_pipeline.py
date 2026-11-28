@@ -12,7 +12,8 @@ from eeg_config import BASES, SOUS_DOSSIER_BRUT
 CODE = {
     1: ["01_chargement_donnees.py", "eeg_config.py", "eeg_utils.py"],
     2: ["02_controle_qualite.py", "eeg_config.py", "eeg_utils.py", "eeg_donnees.py", "eeg_pretraitement.py"],
-    3: ["03_extraction_entropies.py", "eeg_config.py", "eeg_utils.py", "eeg_donnees.py", "eeg_pretraitement.py"],
+    3: ["03_extraction_entropies.py", "eeg_config.py", "eeg_utils.py", "eeg_donnees.py",
+        "eeg_pretraitement.py", "eeg_gpu_entropies.py"],
     4: ["04_fusion_harmonisation.py", "eeg_config.py", "eeg_utils.py", "eeg_donnees.py", "eeg_harmonisation.py"],
 }
 PAQUETS = {

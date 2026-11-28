@@ -11,6 +11,7 @@ from unittest.mock import patch
 import numpy as np
 import pandas as pd
 
+import eeg_gpu_entropies
 from eeg_config import BANDS, BASES, MEASURES, MESURES_ETENDUES, MULTIECHELLE, PUISSANCES
 from eeg_donnees import agreger, agreger_multiechelle, charger_extraction
 
@@ -35,6 +36,60 @@ pipeline = load_script("00_pipeline")
 
 
 class ExtendedFeatureTests(unittest.TestCase):
+    def test_pairwise_backend_matches_cpu_entropy_calculations(self):
+        rng = np.random.default_rng(42)
+        signals = [rng.normal(size=73), np.repeat([0.0, 0.15, 0.3], 24)]
+        for x in signals:
+            for m in (2, 3):
+                with self.subTest(length=len(x), m=m):
+                    b, a = eeg_gpu_entropies.compter_paires(x, m, 0.2, np, bloc=11)
+                    actual = -np.log(a / b) if a and b else np.nan
+                    np.testing.assert_allclose(actual, extract.sample_entropy(x, m=m), equal_nan=True)
+                    actual_fuzzy = eeg_gpu_entropies.fuzzy_entropie(x, m, 0.2, 2, np, bloc=11)
+                    np.testing.assert_allclose(actual_fuzzy, extract.fuzzy_entropy(x, m=m),
+                                               rtol=1e-12, atol=1e-12, equal_nan=True)
+
+    def test_multiscale_gpu_pairwise_route_matches_cpu(self):
+        x = np.random.default_rng(11).normal(size=128)
+        expected = extract.entropies_multiechelle(x, scales=4)
+        with patch.dict(sys.modules, {"cupy": np}):
+            actual = extract.entropies_multiechelle(x, scales=4, calcul="cuda")
+        for name in expected:
+            np.testing.assert_allclose(actual[name], expected[name], rtol=1e-12, atol=1e-12, equal_nan=True)
+
+    def test_component_gpu_route_matches_cpu(self):
+        x = np.random.default_rng(7).normal(size=86)
+        params = dict(entropyhub=False, m=2, r=0.2, n_fuzzy=2, c_disp=6)
+        sd, expected = extract.calculer_mesures(x, {**params, "calcul": "cpu"})
+        with patch.dict(sys.modules, {"cupy": np}):
+            gpu_sd, actual = extract.calculer_mesures(x, {**params, "calcul": "cuda"})
+        self.assertEqual(sd, gpu_sd)
+        for name in expected:
+            np.testing.assert_allclose(actual[name], expected[name], rtol=1e-12, atol=1e-12, equal_nan=True)
+
+    def test_cuda_backend_when_available(self):
+        if importlib.util.find_spec("cupy") is None:
+            self.skipTest("CuPy unavailable")
+        backend, _ = eeg_gpu_entropies.detecter_cuda()
+        if backend != "cuda":
+            self.skipTest("CUDA GPU unavailable")
+        import cupy as cp
+
+        x = np.random.default_rng(13).normal(size=128)
+        np.testing.assert_array_equal(eeg_gpu_entropies.compter_paires(x, 2, 0.2, cp),
+                                      eeg_gpu_entropies.compter_paires(x, 2, 0.2, np))
+        np.testing.assert_allclose(eeg_gpu_entropies.fuzzy_entropie(x, 2, 0.2, 2, cp),
+                                   extract.fuzzy_entropy(x), rtol=1e-10, atol=1e-10)
+        expected = extract.entropies_multiechelle(x, scales=4)
+        actual = extract.entropies_multiechelle(x, scales=4, calcul="cuda")
+        for name in expected:
+            np.testing.assert_allclose(actual[name], expected[name], rtol=1e-10, atol=1e-10, equal_nan=True)
+        params = dict(entropyhub=False, m=2, r=0.2, n_fuzzy=2, c_disp=6)
+        _, expected = extract.calculer_mesures(x, {**params, "calcul": "cpu"})
+        _, actual = extract.calculer_mesures(x, {**params, "calcul": "cuda"})
+        for name in expected:
+            np.testing.assert_allclose(actual[name], expected[name], rtol=1e-10, atol=1e-10, equal_nan=True)
+
     def test_refined_multiscale_entropy_and_flat_signal(self):
         x = np.random.default_rng(42).normal(size=1280)
         values = extract.entropies_multiechelle(x, scales=3)
@@ -104,7 +159,63 @@ class ExtendedFeatureTests(unittest.TestCase):
         self.assertIn("--shap", by_step["09"])
         for step in ("05", "06", "09"):
             self.assertIn("etendues_puissances", by_step[step])
+            self.assertIn("--rapids", by_step[step])
         self.assertTrue(all("--permutations" not in cmd for cmd in commands))
+
+    def test_pipeline_can_disable_rapids(self):
+        commands = []
+
+        class FakeProcess:
+            stdout = []
+
+            def wait(self):
+                return 0
+
+        def launch(cmd, **kwargs):
+            commands.append(cmd)
+            return FakeProcess()
+
+        with tempfile.TemporaryDirectory() as tmp, \
+             patch.object(pipeline, "SCRIPT_DIR", Path(tmp)), \
+             patch.object(pipeline.subprocess, "Popen", side_effect=launch), \
+             patch.object(sys, "argv", ["00_pipeline.py", "--etapes", "5", "6", "9", "--sans-rapids"]), \
+             self.assertRaises(SystemExit) as result:
+            pipeline.main()
+        self.assertEqual(result.exception.code, 0)
+        self.assertEqual(len(commands), 3)
+        self.assertTrue(all("--rapids" not in command for command in commands))
+
+    def test_pipeline_cache_records_entropy_backend(self):
+        commands = []
+        device = {"device": "test GPU", "cupy": "test", "driver": 1, "runtime": 1}
+
+        class FakeProcess:
+            def __init__(self):
+                self.stdout = [f"SORTIE : {base}_run\n" for base in BASES]
+
+            def wait(self):
+                return 0
+
+        def launch(cmd, **kwargs):
+            commands.append(cmd)
+            return FakeProcess()
+
+        with tempfile.TemporaryDirectory() as tmp, \
+             patch.object(pipeline, "SCRIPT_DIR", Path(tmp)), \
+             patch.object(pipeline, "entrees_etape", return_value=[Path(tmp)]), \
+             patch.object(pipeline, "detecter_cuda", return_value=("cuda", device)), \
+             patch.object(pipeline, "signature", return_value="key") as sign, \
+             patch.object(pipeline, "CachePipeline") as cache, \
+             patch.object(pipeline.subprocess, "Popen", side_effect=launch), \
+             patch.object(sys, "argv", ["00_pipeline.py", "--etapes", "3"]), \
+             self.assertRaises(SystemExit) as result:
+            cache.return_value.trouver.return_value = None
+            pipeline.main()
+        self.assertEqual(result.exception.code, 0)
+        self.assertEqual(commands[0][commands[0].index("--calcul") + 1], "cuda")
+        options = sign.call_args_list[0].args[2]
+        self.assertEqual(options[options.index("--calcul") + 1], "cuda")
+        self.assertEqual(json.loads(options[options.index("--gpu-info") + 1]), device)
 
     def test_explicit_network_step_and_failed_network_are_handled(self):
         for exit_code in (0, 1):

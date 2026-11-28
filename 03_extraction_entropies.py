@@ -56,6 +56,7 @@ from scipy.signal import welch
 from scipy.special import ndtr
 from scipy.spatial import cKDTree
 
+import eeg_gpu_entropies as gpu_entropies
 from eeg_config import AMPLITUDE, BANDPASS, BANDS, BASES, FS_CIBLE, MEASURES, MESURES_ETENDUES, MULTIECHELLE, PUISSANCES
 from eeg_donnees import canaux_sauvegardes, charger_signaux
 from eeg_pretraitement import bandpass, notch, pretraiter, reechantillonner
@@ -212,6 +213,17 @@ def calculer_mesures(coef, p):
     x = (coef - coef.mean()) / sd
     if p["entropyhub"]:
         vals = entropies_entropyhub(x, p)
+    elif p.get("calcul") == "cuda":
+        import cupy as cp
+
+        if len(x) <= p["m"] + 2:
+            sample, fuzzy = np.nan, np.nan
+        else:
+            b, a = gpu_entropies.compter_paires(x, p["m"], p["r"], cp)
+            sample = float(-np.log(a / b)) if a > 0 and b > 0 else np.nan
+            fuzzy = gpu_entropies.fuzzy_entropie(x, p["m"], p["r"], p["n_fuzzy"], cp)
+        vals = {"SampEn": sample, "FuzzyEn": fuzzy,
+                "DispEn": dispersion_entropy(x, p["m"], p["c_disp"])}
     else:
         vals = {"SampEn": sample_entropy(x, p["m"], p["r"]),
                 "FuzzyEn": fuzzy_entropy(x, p["m"], p["r"], p["n_fuzzy"]),
@@ -239,7 +251,7 @@ def mesures_etendues(coef):
     return values
 
 
-def entropies_multiechelle(signal, scales=10):
+def entropies_multiechelle(signal, scales=10, calcul="cpu"):
     """RCMSE et RCMPE sur le signal large bande, selon Xu et al. (2025)."""
     signal = np.asarray(signal, dtype=np.float64)
     if not np.isfinite(signal).all() or signal.std() == 0:
@@ -255,14 +267,21 @@ def entropies_multiechelle(signal, scales=10):
             coarse = x[offset:offset + n * scale].reshape(n, scale).mean(axis=1)
             if len(coarse) < 5:
                 raise ValueError(f"Série trop courte pour l'échelle {scale}")
-            templates = np.lib.stride_tricks.sliding_window_view(coarse, 3)
-            for dim in (2, 3):
-                tree = cKDTree(templates[:, :dim])
-                pairs = (tree.count_neighbors(tree, 0.15, p=np.inf) - len(templates)) / 2
-                if dim == 2:
-                    counts_m += pairs
-                else:
-                    counts_next += pairs
+            if calcul == "cuda":
+                import cupy as cp
+
+                pairs_m, pairs_next = gpu_entropies.compter_paires(coarse, 2, 0.15, cp)
+                counts_m += pairs_m
+                counts_next += pairs_next
+            else:
+                templates = np.lib.stride_tricks.sliding_window_view(coarse, 3)
+                for dim in (2, 3):
+                    tree = cKDTree(templates[:, :dim])
+                    pairs = (tree.count_neighbors(tree, 0.15, p=np.inf) - len(templates)) / 2
+                    if dim == 2:
+                        counts_m += pairs
+                    else:
+                        counts_next += pairs
             patterns = np.argsort(np.lib.stride_tricks.sliding_window_view(coarse, 4),
                                   axis=1, kind="stable")
             unique, counts = np.unique(patterns, axis=0, return_counts=True)
@@ -294,7 +313,7 @@ def process_subject(task):
         seg = sig[:, s:s + win]
         for ch in range(seg.shape[0]):
             coefs = dwt_bands(seg[ch], FS_CIBLE, p["ondelette"])
-            multiscale = entropies_multiechelle(seg[ch]) if p.get("multiechelle") else {}
+            multiscale = entropies_multiechelle(seg[ch], calcul=p.get("calcul", "cpu")) if p.get("multiechelle") else {}
             if p["caracteristiques_etendues"]:
                 energies = np.array([np.sum(coef ** 2) for coef in coefs])
                 if not np.isfinite(energies).all():
@@ -421,12 +440,16 @@ def main():
     p.add_argument("--large", action="store_true", help="Écrire aussi features_large.csv (une ligne par fenêtre).")
     p.add_argument("--limite", type=int, default=None, help="N premiers enregistrements seulement (essai).")
     p.add_argument("--workers", type=int, default=max(1, (os.cpu_count() or 2) - 1))
+    p.add_argument("--calcul", choices=["auto", "cpu", "cuda"], default="auto",
+                   help="GPU CUDA pour SampEn, FuzzyEn et RCMSE si disponible ; les autres mesures restent sur CPU.")
     args = p.parse_args()
     bad = [b for b in args.bases if b not in BASES]
     if bad:
         p.error(f"base(s) inconnue(s) : {bad}")
     if args.notch is not None:
         p.error("Le coupe-bande se règle en 02 ; relancer 02 avec --notch.")
+    if args.workers < 1:
+        p.error("--workers doit être >= 1.")
     if args.donnees is None:
         args.donnees = dernier_dossier("qc", contient="controle_qualite.json")
     if args.donnees is None:
@@ -435,10 +458,20 @@ def main():
         import EntropyHub  # noqa: F401
     except ModuleNotFoundError:
         p.error("EntropyHub est requis pour ApEn et PermEn (pip install EntropyHub).")
+    calcul, gpu_info = ("cpu", None) if args.calcul == "cpu" else gpu_entropies.detecter_cuda()
+    if args.calcul == "cuda" and calcul != "cuda":
+        p.error("GPU CUDA demandé mais indisponible.")
+    if calcul == "cuda" and args.workers != 1:
+        log("GPU CUDA : utilisation d'un seul processus pour éviter les contextes GPU concurrents.")
+        args.workers = 1
+    log("GPU : SampEn, FuzzyEn, RCMSE ; CPU : DWT, DispEn, Shannon, LZC, ApEn, PermEn, RCMPE et puissances."
+        if calcul == "cuda" and not args.entropyhub else
+        "GPU : RCMSE ; CPU : DWT et autres mesures." if calcul == "cuda" else "Toutes les mesures sur CPU.")
     params = dict(fenetre=args.fenetre, chevauchement=args.chevauchement, duree_max=args.duree_max,
                   notch=args.notch, ondelette=args.ondelette, m=args.m, r=args.r, n_fuzzy=args.n_fuzzy,
                   c_disp=args.c_disp, entropyhub=args.entropyhub,
-                  caracteristiques_etendues=True, multiechelle=True, pretraite=True, bandpass=list(BANDPASS))
+                  caracteristiques_etendues=True, multiechelle=True, pretraite=True, bandpass=list(BANDPASS),
+                  calcul=calcul, gpu_info=gpu_info)
     log(f"workers = {args.workers}")
     sorties = []
     for base in args.bases or BASES:

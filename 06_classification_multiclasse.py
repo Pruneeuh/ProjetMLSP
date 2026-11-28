@@ -39,8 +39,14 @@ Usage :
 Dépendances : numpy pandas scipy scikit-learn matplotlib xgboost lightgbm
 """
 import argparse
+import sys
 import time
 from pathlib import Path
+
+RAPIDS_ACTIF = False
+if __name__ == "__main__" and "--rapids" in sys.argv and "--cpu" not in sys.argv:
+    from gpu_setup import enable_cuml_accel
+    RAPIDS_ACTIF = enable_cuml_accel()
 
 from eeg_tuning import detect_devices, predict_proba, tune_and_fit
 
@@ -331,7 +337,9 @@ def main():
     p.add_argument("--profil-tuning", choices=["quick", "comprehensive"], default="comprehensive")
     p.add_argument("--plis-internes", type=int, default=None)
     p.add_argument("--tirages-tuning", type=int, default=None)
-    p.add_argument("--cpu", action="store_true", help="Désactiver les sondes GPU et utiliser le CPU.")
+    calcul = p.add_mutually_exclusive_group()
+    calcul.add_argument("--cpu", action="store_true", help="Désactiver les sondes GPU et utiliser le CPU.")
+    calcul.add_argument("--rapids", action="store_true", help="Essayer RAPIDS pour les modèles compatibles.")
     p.add_argument("--coral-composantes", type=int, default=20)
     p.add_argument("--filtrage-fraction", type=float, default=0.5)
     p.add_argument("--filtrage-arbres", type=int, default=200)
@@ -361,7 +369,8 @@ def main():
     if "xgboost" in args.modeles + args.permutation_modeles and not xgboost_disponible():
         p.error("xgboost demandé mais absent (pip install xgboost).")
     args.devices = {"xgboost": "cpu", "lightgbm": "cpu"} if args.cpu else detect_devices(args.modeles + args.permutation_modeles)
-    log(f"Calcul : XGBoost={args.devices['xgboost']}, LightGBM={args.devices['lightgbm']}; autres modèles sur CPU.")
+    log(f"Calcul : XGBoost={args.devices['xgboost']}, LightGBM={args.devices['lightgbm']}; "
+        + ("RAPIDS actif : voir ses journaux GPU/CPU." if RAPIDS_ACTIF else "autres modèles sur CPU."))
     args.harmonisations = list(dict.fromkeys(args.harmonisations))
     eh.configurer(args)
 
